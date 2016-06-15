@@ -191,9 +191,11 @@ static int get_link_snr(struct wmediumd *ctx,
 	return ctx->snr_matrix[sender->index * ctx->num_stas + receiver->index];
 }
 
-void queue_frame(struct wmediumd *ctx, struct station *station,
+void queue_frame(struct wmediumd *ctx,
 		 struct frame *frame)
 {
+	struct station *station = frame->sender;
+
 	struct ieee80211_hdr *hdr = (void *)frame->data;
 	u8 *dest = hdr->addr1;
 	struct timespec now, target;
@@ -579,6 +581,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			memcpy(frame->tx_rates, tx_rates,
 			       min(tx_rates_len, sizeof(frame->tx_rates)));
 			queue_frame(ctx, sender, frame);
+			queue_frame(ctx, frame);
 		}
 	}
 out:
