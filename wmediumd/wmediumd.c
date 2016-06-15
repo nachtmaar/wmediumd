@@ -580,8 +580,11 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 				tx_rates_len / sizeof(struct hwsim_tx_rate);
 			memcpy(frame->tx_rates, tx_rates,
 			       min(tx_rates_len, sizeof(frame->tx_rates)));
-			queue_frame(ctx, sender, frame);
+
+			// queue frame
 			queue_frame(ctx, frame);
+			// TODO: send via socket
+			// TODO: receive incoming frames and queue them
 		}
 	}
 out:
