@@ -35,6 +35,7 @@
 #include "ieee80211.h"
 #include "config.h"
 
+static struct wmediumd *wmediumd;
 static int index_to_rate[] = {
 	60, 90, 120, 180, 240, 360, 480, 540
 };
@@ -80,7 +81,7 @@ void timespec_add_usec(struct timespec *t, int usec)
 	}
 }
 
-void rearm_timer(struct wmediumd *ctx)
+void rearm_timer()
 {
 	struct timespec min_expires;
 	struct itimerspec expires = {};
@@ -94,7 +95,7 @@ void rearm_timer(struct wmediumd *ctx)
 	 * Iterate over all the interfaces to find the next frame that
 	 * will be delivered, and set the timerfd accordingly.
 	 */
-	list_for_each_entry(station, &ctx->stations, list) {
+	list_for_each_entry(station, &wmediumd->stations, list) {
 		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
 			frame = list_first_entry_or_null(&station->queues[i].frames,
 							 struct frame, list);
@@ -108,7 +109,7 @@ void rearm_timer(struct wmediumd *ctx)
 		}
 	}
 	expires.it_value = min_expires;
-	timerfd_settime(ctx->timerfd, TFD_TIMER_ABSTIME, &expires, NULL);
+	timerfd_settime(wmediumd->timerfd, TFD_TIMER_ABSTIME, &expires, NULL);
 }
 
 static inline bool frame_has_a4(struct frame *frame)
@@ -173,26 +174,24 @@ bool is_multicast_ether_addr(const u8 *addr)
 	return 0x01 & addr[0];
 }
 
-static struct station *get_station_by_addr(struct wmediumd *ctx, u8 *addr)
+static struct station *get_station_by_addr(u8 *addr)
 {
 	struct station *station;
 
-	list_for_each_entry(station, &ctx->stations, list) {
+	list_for_each_entry(station, &wmediumd->stations, list) {
 		if (memcmp(station->addr, addr, ETH_ALEN) == 0)
 			return station;
 	}
 	return NULL;
 }
 
-static int get_link_snr(struct wmediumd *ctx,
-			struct station *sender,
+static int get_link_snr(struct station *sender,
 			struct station *receiver)
 {
-	return ctx->snr_matrix[sender->index * ctx->num_stas + receiver->index];
+	return wmediumd->snr_matrix[sender->index * wmediumd->num_stas + receiver->index];
 }
 
-void queue_frame(struct wmediumd *ctx,
-		 struct frame *frame)
+void queue_frame(struct frame *frame)
 {
 	struct station *station = frame->sender;
 
@@ -239,9 +238,9 @@ void queue_frame(struct wmediumd *ctx,
 	int snr = SNR_DEFAULT;
 
 	if (!is_multicast_ether_addr(dest)) {
-		struct station *deststa = get_station_by_addr(ctx, dest);
+		struct station *deststa = get_station_by_addr(dest);
 		if (deststa)
-			snr = get_link_snr(ctx, station, deststa);
+			snr = get_link_snr(station, deststa);
 	}
 	frame->signal = snr;
 
@@ -302,7 +301,7 @@ void queue_frame(struct wmediumd *ctx,
 	 */
 	target = now;
 	for (i = 0; i <= ac; i++) {
-		list_for_each_entry(tmpsta, &ctx->stations, list) {
+		list_for_each_entry(tmpsta, &wmediumd->stations, list) {
 			tail = list_last_entry_or_null(&tmpsta->queues[i].frames,
 						       struct frame, list);
 			if (tail && timespec_before(&target, &tail->expires))
@@ -314,19 +313,18 @@ void queue_frame(struct wmediumd *ctx,
 
 	frame->expires = target;
 	list_add_tail(&frame->list, &queue->frames);
-	rearm_timer(ctx);
+	rearm_timer(wmediumd);
 }
 
 /*
  * Report transmit status to the kernel.
  */
-int send_tx_info_frame_nl(struct wmediumd *ctx,
-			  struct station *src,
+int send_tx_info_frame_nl(struct station *src,
 			  unsigned int flags, int signal,
 			  struct hwsim_tx_rate *tx_attempts,
 			  u64 cookie)
 {
-	struct nl_sock *sock = ctx->sock;
+	struct nl_sock *sock = wmediumd->sock;
 	struct nl_msg *msg;
 
 	msg = nlmsg_alloc();
@@ -335,7 +333,7 @@ int send_tx_info_frame_nl(struct wmediumd *ctx,
 		goto out;
 	}
 
-	genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(ctx->family),
+	genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(wmediumd->family),
 		    0, NLM_F_REQUEST, HWSIM_CMD_TX_INFO_FRAME, VERSION_NR);
 
 	int rc;
@@ -365,11 +363,11 @@ out:
 /*
  * Send a data frame to the kernel for reception at a specific radio.
  */
-int send_cloned_frame_msg(struct wmediumd *ctx, struct station *dst,
+int send_cloned_frame_msg(struct station *dst,
 			  u8 *data, int data_len, int rate_idx, int signal)
 {
 	struct nl_msg *msg;
-	struct nl_sock *sock = ctx->sock;
+	struct nl_sock *sock = wmediumd->sock;
 
 	msg = nlmsg_alloc();
 	if (!msg) {
@@ -377,7 +375,7 @@ int send_cloned_frame_msg(struct wmediumd *ctx, struct station *dst,
 		goto out;
 	}
 
-	genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(ctx->family),
+	genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(wmediumd->family),
 		    0, NLM_F_REQUEST, HWSIM_CMD_FRAME, VERSION_NR);
 
 	int rc;
@@ -402,7 +400,7 @@ out:
 	return -1;
 }
 
-void deliver_frame(struct wmediumd *ctx, struct frame *frame)
+void deliver_frame(struct frame *frame)
 {
 	struct ieee80211_hdr *hdr = (void *) frame->data;
 	struct station *station;
@@ -411,7 +409,7 @@ void deliver_frame(struct wmediumd *ctx, struct frame *frame)
 
 	if (frame->flags & HWSIM_TX_STAT_ACK) {
 		/* rx the frame on the dest interface */
-		list_for_each_entry(station, &ctx->stations, list) {
+		list_for_each_entry(station, &wmediumd->stations, list) {
 			if (memcmp(src, station->addr, ETH_ALEN) == 0)
 				continue;
 
@@ -424,7 +422,7 @@ void deliver_frame(struct wmediumd *ctx, struct frame *frame)
 				 * reverse link from sender -- check for
 				 * each receiver.
 				 */
-				signal = get_link_snr(ctx, station, frame->sender);
+				signal = get_link_snr(station, frame->sender);
 				rate_idx = frame->tx_rates[0].idx;
 				error_prob = get_error_prob((double)signal,
 							    rate_idx, frame->data_len);
@@ -436,13 +434,13 @@ void deliver_frame(struct wmediumd *ctx, struct frame *frame)
 					continue;
 				}
 
-				send_cloned_frame_msg(ctx, station,
+				send_cloned_frame_msg(station,
 						      frame->data,
 						      frame->data_len,
 						      1, signal);
 
 			} else if (memcmp(dest, station->addr, ETH_ALEN) == 0) {
-				send_cloned_frame_msg(ctx, station,
+				send_cloned_frame_msg(station,
 						      frame->data,
 						      frame->data_len,
 						      1, frame->signal);
@@ -450,14 +448,13 @@ void deliver_frame(struct wmediumd *ctx, struct frame *frame)
 		}
 	}
 
-	send_tx_info_frame_nl(ctx, frame->sender, frame->flags,
+	send_tx_info_frame_nl(frame->sender, frame->flags,
 			      frame->signal, frame->tx_rates, frame->cookie);
 
 	free(frame);
 }
 
-void deliver_expired_frames_queue(struct wmediumd *ctx,
-				  struct list_head *queue,
+void deliver_expired_frames_queue(struct list_head *queue,
 				  struct timespec *now)
 {
 	struct frame *frame, *tmp;
@@ -465,7 +462,7 @@ void deliver_expired_frames_queue(struct wmediumd *ctx,
 	list_for_each_entry_safe(frame, tmp, queue, list) {
 		if (timespec_before(&frame->expires, now)) {
 			list_del(&frame->list);
-			deliver_frame(ctx, frame);
+			deliver_frame(frame);
 		} else {
 			break;
 		}
@@ -494,7 +491,7 @@ void deliver_expired_frames(struct wmediumd *ctx)
 		       q_ct[IEEE80211_AC_VI], q_ct[IEEE80211_AC_VO]);
 
 		for (i = 0; i < IEEE80211_NUM_ACS; i++)
-			deliver_expired_frames_queue(ctx, &station->queues[i].frames, &now);
+			deliver_expired_frames_queue(&station->queues[i].frames, &now);
 	}
 	printf("\n\n");
 }
@@ -516,7 +513,6 @@ int nl_err_cb(struct sockaddr_nl *nla, struct nlmsgerr *nlerr, void *arg)
  */
 static int process_messages_cb(struct nl_msg *msg, void *arg)
 {
-	struct wmediumd *ctx = arg;
 	struct nlattr *attrs[HWSIM_ATTR_MAX+1];
 
 	// split kernel `msg` into header and body
@@ -559,7 +555,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 				goto out;
 
 			// create sender struct
-			sender = get_station_by_addr(ctx, src);
+			sender = get_station_by_addr(src);
 			if (!sender) {
 				fprintf(stderr, "Unable to find sender station " MAC_FMT "\n", MAC_ARGS(src));
 				goto out;
@@ -583,6 +579,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 
 			// queue frame
 			queue_frame(ctx, frame);
+			queue_frame(frame);
 			// TODO: send via socket
 			// TODO: receive incoming frames and queue them
 		}
@@ -591,12 +588,13 @@ out:
 	return 0;
 }
 
+
 /*
  * Register with the kernel to start receiving new frames.
  */
-int send_register_msg(struct wmediumd *ctx)
+int send_register_msg()
 {
-	struct nl_sock *sock = ctx->sock;
+	struct nl_sock *sock = wmediumd->sock;
 	struct nl_msg *msg;
 
 	msg = nlmsg_alloc();
@@ -605,7 +603,7 @@ int send_register_msg(struct wmediumd *ctx)
 		return -1;
 	}
 
-	genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(ctx->family),
+	genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(wmediumd->family),
 		    0, NLM_F_REQUEST, HWSIM_CMD_REGISTER, VERSION_NR);
 	nl_send_auto_complete(sock, msg);
 	nlmsg_free(msg);
@@ -615,44 +613,43 @@ int send_register_msg(struct wmediumd *ctx)
 
 static void sock_event_cb(int fd, short what, void *data)
 {
-	struct wmediumd *ctx = data;
 
-	nl_recvmsgs_default(ctx->sock);
+	nl_recvmsgs_default(wmediumd->sock);
 }
 
 /*
  * Setup netlink socket and callbacks.
  */
-void init_netlink(struct wmediumd *ctx)
+void init_netlink()
 {
 	struct nl_sock *sock;
 
-	ctx->cb = nl_cb_alloc(NL_CB_CUSTOM);
-	if (!ctx->cb) {
+	wmediumd->cb = nl_cb_alloc(NL_CB_CUSTOM);
+	if (!wmediumd->cb) {
 		printf("Error allocating netlink callbacks\n");
 		exit(EXIT_FAILURE);
 	}
 
-	sock = nl_socket_alloc_cb(ctx->cb);
+	sock = nl_socket_alloc_cb(wmediumd->cb);
 	if (!sock) {
 		printf("Error allocating netlink socket\n");
 		exit(EXIT_FAILURE);
 	}
 
-	ctx->sock = sock;
+	wmediumd->sock = sock;
 
 	genl_connect(sock);
-	genl_ctrl_alloc_cache(sock, &ctx->cache);
+	genl_ctrl_alloc_cache(sock, &wmediumd->cache);
 
-	ctx->family = genl_ctrl_search_by_name(ctx->cache, "MAC80211_HWSIM");
+	wmediumd->family = genl_ctrl_search_by_name(wmediumd->cache, "MAC80211_HWSIM");
 
-	if (!ctx->family) {
+	if (!wmediumd->family) {
 		printf("Family MAC80211_HWSIM not registered\n");
 		exit(EXIT_FAILURE);
 	}
 
-	nl_cb_set(ctx->cb, NL_CB_MSG_IN, NL_CB_CUSTOM, process_messages_cb, ctx);
-	nl_cb_err(ctx->cb, NL_CB_CUSTOM, nl_err_cb, ctx);
+	nl_cb_set(wmediumd->cb, NL_CB_MSG_IN, NL_CB_CUSTOM, process_messages_cb, wmediumd);
+	nl_cb_err(wmediumd->cb, NL_CB_CUSTOM, nl_err_cb, wmediumd);
 }
 
 /*
@@ -679,12 +676,15 @@ static void timer_cb(int fd, short what, void *data)
 	rearm_timer(ctx);
 }
 
+
 int main(int argc, char *argv[])
 {
 	int opt;
 	struct event ev_cmd;
 	struct event ev_timer;
 	struct wmediumd ctx;
+	wmediumd = &ctx;
+	
 	char *config_file = NULL;
 
 	setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
@@ -737,7 +737,7 @@ int main(int argc, char *argv[])
 	event_init();
 
 	/* init netlink */
-	init_netlink(&ctx);
+	init_netlink();
 	event_set(&ev_cmd, nl_socket_get_fd(ctx.sock), EV_READ | EV_PERSIST,
 		  sock_event_cb, &ctx);
 	event_add(&ev_cmd, NULL);
@@ -748,7 +748,7 @@ int main(int argc, char *argv[])
 	event_add(&ev_timer, NULL);
 
 	/* register for new frames */
-	if (send_register_msg(&ctx) == 0)
+	if (send_register_msg() == 0)
 		printf("REGISTER SENT!\n");
 
 	/* enter libevent main loop */
