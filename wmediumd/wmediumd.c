@@ -516,6 +516,9 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 {
 	struct wmediumd *ctx = arg;
 	struct nlattr *attrs[HWSIM_ATTR_MAX+1];
+
+	// split kernel `msg` into header and body
+
 	/* netlink header */
 	struct nlmsghdr *nlh = nlmsg_hdr(msg);
 	/* generic netlink header*/
@@ -526,12 +529,14 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 	struct ieee80211_hdr *hdr;
 	u8 *src;
 
+	// handle only command frames
 	if (gnlh->cmd == HWSIM_CMD_FRAME) {
-		/* we get the attributes*/
+		/* we get the attributes from `nlh` */
 		genlmsg_parse(nlh, 0, attrs, HWSIM_ATTR_MAX, NULL);
 		if (attrs[HWSIM_ATTR_ADDR_TRANSMITTER]) {
+			
+			// put items from `attrs` into local vars
 			u8 *hwaddr = (u8 *)nla_data(attrs[HWSIM_ATTR_ADDR_TRANSMITTER]);
-
 			unsigned int data_len =
 				nla_len(attrs[HWSIM_ATTR_FRAME]);
 			char *data = (char *)nla_data(attrs[HWSIM_ATTR_FRAME]);
@@ -544,12 +549,14 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 				nla_data(attrs[HWSIM_ATTR_TX_INFO]);
 			u64 cookie = nla_get_u64(attrs[HWSIM_ATTR_COOKIE]);
 
+			// ieee80211 frame
 			hdr = (struct ieee80211_hdr *)data;
 			src = hdr->addr2;
 
 			if (data_len < 6 + 6 + 4)
 				goto out;
 
+			// create sender struct
 			sender = get_station_by_addr(ctx, src);
 			if (!sender) {
 				fprintf(stderr, "Unable to find sender station " MAC_FMT "\n", MAC_ARGS(src));
@@ -561,6 +568,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			if (!frame)
 				goto out;
 
+			// envelope ieee 80211 frame
 			memcpy(frame->data, data, data_len);
 			frame->data_len = data_len;
 			frame->flags = flags;
