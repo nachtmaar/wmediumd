@@ -114,4 +114,21 @@ struct frame {
 void station_init_queues(struct station *station);
 double get_error_prob(double snr, unsigned int rate_idx, int frame_len);
 
+struct frame_copy {
+	struct timespec expires;	/* frame delivery (absolute) */
+	bool acked;
+	u64 cookie;
+	int flags;
+	int signal;
+	int tx_rates_count;
+	// u8, list_head
+	int sender;
+	struct hwsim_tx_rate tx_rates[IEEE80211_TX_MAX_RATES];
+	size_t data_len;
+	u8 data[0];			/* frame contents */
+};
+
+int mysocket;
+
+
 #endif /* WMEDIUMD_H_ */

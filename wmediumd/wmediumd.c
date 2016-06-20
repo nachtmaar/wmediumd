@@ -35,7 +35,82 @@
 #include "ieee80211.h"
 #include "config.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include "message.h"
+
+
 static struct wmediumd *wmediumd;
+
+
+struct frame_copy* frame_transform(struct frame *frame) {
+	struct frame_copy *frame_copy = malloc(sizeof(struct frame_copy) + frame->data_len);
+
+	frame_copy->expires.tv_sec = frame->expires.tv_sec;
+	frame_copy->expires.tv_nsec = frame->expires.tv_nsec;
+
+	frame_copy->acked = frame->acked;
+	frame_copy->cookie = frame->cookie;
+	frame_copy->flags = frame->flags;
+	frame_copy->signal = frame->signal;
+	frame_copy->tx_rates_count = frame->tx_rates_count;
+	// copy index of station instead of whole structure
+	frame_copy->sender = frame->sender->index;
+
+	// copy array value by value
+	for(int i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
+		frame_copy->tx_rates[i] = frame->tx_rates[i];
+	}
+
+	frame_copy->data_len = frame->data_len;
+
+	// copy data array
+	memcpy(frame_copy->data, frame->data, frame->data_len);
+
+	return frame_copy;
+}
+
+struct station *get_sender_station_by_index(int index) {
+	struct station *cur_station;
+	list_for_each_entry(cur_station, &wmediumd->stations, list) {
+		if(cur_station->index == index) {
+			return cur_station;
+		}
+	}
+	//perror("Station not found for index: %d\n", index);
+	return NULL;
+}
+
+struct frame* frame_detransform(struct frame_copy *frame_copy) {
+	struct frame *frame = malloc(sizeof(struct frame) + frame_copy->data_len);
+
+	frame->expires.tv_sec = frame_copy->expires.tv_sec;
+	frame->expires.tv_nsec = frame_copy->expires.tv_nsec;
+
+	frame->acked = frame_copy->acked;
+	frame->cookie = frame_copy->cookie;
+	frame->flags = frame_copy->flags;
+	frame->signal = frame_copy->signal;
+	frame->tx_rates_count = frame_copy->tx_rates_count;
+	// copy index of station instead of whole structure
+	frame->sender = get_sender_station_by_index(frame_copy->sender);
+
+	for(int i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
+		frame->tx_rates[i] = frame_copy->tx_rates[i];
+	}
+
+	memcpy(frame->data, frame_copy->data, frame_copy->data_len);
+	frame->data_len = frame_copy->data_len;
+
+	return frame;
+}
 static int index_to_rate[] = {
 	60, 90, 120, 180, 240, 360, 480, 540
 };
@@ -58,6 +133,15 @@ static void wqueue_init(struct wqueue *wqueue, int cw_min, int cw_max)
 	wqueue->cw_max = cw_max;
 }
 
+/**
+ * http://permalink.gmane.org/gmane.linux.kernel.wireless.general/98501
+ * IEEE802.11e (Quality of Service)
+ *
+ * IEEE80211_AC_BE is best-effort traffic,
+ * IEEE80211_AC_BK is background traffic,
+ * IEEE80211_AC_VI is video traffic,
+ * IEEE80211_AC_VO is voice traffic.
+ */
 void station_init_queues(struct station *station)
 {
 	wqueue_init(&station->queues[IEEE80211_AC_BK], 15, 1023);
@@ -577,9 +661,20 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			memcpy(frame->tx_rates, tx_rates,
 			       min(tx_rates_len, sizeof(frame->tx_rates)));
 
+
+			struct frame_copy *transformed_frame;
+			struct frame *detransformed_frame;
+
+			transformed_frame = frame_transform(frame);
+			detransformed_frame = frame_detransform(transformed_frame);
+
+			frame = detransformed_frame;
+
 			// queue frame
-			queue_frame(ctx, frame);
 			queue_frame(frame);
+			// TODO:
+//			free(transformed_frame);
+//			free(detransformed_frame);
 			// TODO: send via socket
 			// TODO: receive incoming frames and queue them
 		}
