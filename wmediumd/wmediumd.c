@@ -111,6 +111,55 @@ struct frame* frame_detransform(struct frame_copy *frame_copy) {
 
 	return frame;
 }
+
+#define MAXRCVLEN 8192
+
+int connect_frame_distribution_socket() {
+
+	//char buffer[MAXRCVLEN + 1]; /* +1 so we can add null terminator */
+	struct sockaddr_in dest;
+
+	mysocket = socket(AF_INET, SOCK_STREAM, 0);
+	if(mysocket == -1) {
+		printf("Error: Could not create socket \n");
+		return EXIT_FAILURE;
+	}
+
+	memset(&dest, 0, sizeof(dest));                /* zero the struct */
+	dest.sin_family = AF_INET;
+	dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* set destination IP number - localhost, 127.0.0.1*/
+	dest.sin_port = htons(PORTNUM);                /* set destination port number */
+
+	if(connect(mysocket, (struct sockaddr *)&dest, sizeof(struct sockaddr)) == -1) {
+		printf("Error : Connect Failed \n");
+		return EXIT_FAILURE;
+	}
+
+	return EXIT_SUCCESS;
+}
+
+int disconnect_frame_distribution_socket() {
+	// TODO: how to handle close and free if returned by error?
+	close(mysocket);
+	return EXIT_SUCCESS;
+}
+
+int send_frame(struct frame_copy *frame_copy)
+{
+	struct message *message = new_message(frame_copy);
+	if(send(mysocket, message, sizeof(struct message) + frame_copy->data_len, 0) == -1) {
+		printf("Error : Send Failed \n");
+		return EXIT_FAILURE;
+	}
+	else {
+		printf("Sent ieee80211 frame ...\n");
+	}
+
+
+	// TODO: finally!
+//	free(message);
+	return EXIT_SUCCESS;
+}
 static int index_to_rate[] = {
 	60, 90, 120, 180, 240, 360, 480, 540
 };
@@ -831,6 +880,11 @@ int main(int argc, char *argv[])
 	/* init libevent */
 	event_init();
 
+	if(connect_frame_distribution_socket() == EXIT_FAILURE) {
+		printf("Could not open frame distribution channel!\n");
+		return EXIT_FAILURE;
+	}
+
 	/* init netlink */
 	init_netlink();
 	event_set(&ev_cmd, nl_socket_get_fd(ctx.sock), EV_READ | EV_PERSIST,
@@ -853,6 +907,8 @@ int main(int argc, char *argv[])
 	free(ctx.cb);
 	free(ctx.cache);
 	free(ctx.family);
+
+	disconnect_frame_distribution_socket();
 
 	return EXIT_SUCCESS;
 }

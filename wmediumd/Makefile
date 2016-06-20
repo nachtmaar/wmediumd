@@ -48,7 +48,7 @@ NLVERSION :=$(shell $(PKG_CONFIG) --print-provides $(NLLIBNAME))
 
 CFLAGS+=-DVERSION_STR=$(VERSION_STR) -g
 LDFLAGS+=-lconfig 
-OBJECTS=wmediumd.o config.o per.o
+OBJECTS=wmediumd.o config.o per.o message.o# ieee80211_frame_receiver.o
 
 all: wmediumd 
 
