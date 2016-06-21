@@ -43,15 +43,78 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <assert.h>
 
 #include "message.h"
 
 
+#define BUF_SIZE 8192
 static struct wmediumd *wmediumd;
+
+static struct frame_copy static_frame_copy;
+
+ssize_t recv_n_bytes(int socket, char *buffer, int cnt_bytes) {
+	// clear buffer
+	memset(buffer, 0, BUF_SIZE);
+
+	// TODO: check MSG_WAITALL flag!
+	// SO_RCVLOWAT: set minimum count for input
+	setsockopt(socket, SOL_SOCKET, SO_RCVLOWAT, &cnt_bytes, sizeof(cnt_bytes));
+	ssize_t recv_bytes = recv(socket, buffer, cnt_bytes, 0);
+
+	return recv_bytes;
+}
+
+struct frame_copy* recv_frame_copy(int socket, char *buffer) {
+	ssize_t len;
+
+	// equal to sizeof
+	int min_byte_size = sizeof(static_frame_copy.total_struct_length);
+	printf("size of frame_copy.total_struct_length: %d\n", min_byte_size);
+	len = recv_n_bytes(socket, buffer, min_byte_size);
+	if(0 < len) {
+
+		printf("Received %ld bytes\n", len);
+
+		// copy received length
+		int frame_len;
+		assert(min_byte_size == sizeof(unsigned int));
+
+		memcpy(&frame_len, buffer, min_byte_size);
+		printf("Frame length: %d\n", frame_len);
+		if(BUF_SIZE < frame_len) {
+			fprintf(stderr, "Frame length too big: %d! Buffer size: %d)\n", frame_len, BUF_SIZE);
+			exit(1);
+		}
+
+		min_byte_size = frame_len;
+		len = recv_n_bytes(socket, buffer, min_byte_size);
+		if(len < min_byte_size) {
+			fprintf(stderr, "min byte size not received! is: %ld, was:%d)\n", len, min_byte_size);
+			exit(1);
+		}
+		printf("Received frame length: %ld\n", len);
+		
+		// get struct from buffer
+		// TODO: check every malloc call ...
+		struct frame_copy *frame_copy = malloc(len);
+		memcpy(frame_copy, buffer, len);
+		printf("received frame ...\n");
+
+		return frame_copy;
+	}
+
+		// EOL
+	else {
+		printf("EOL\n");
+		exit(0);
+	}
+}
 
 
 struct frame_copy* frame_transform(struct frame *frame) {
-	struct frame_copy *frame_copy = malloc(sizeof(struct frame_copy) + frame->data_len);
+	int total_struct_length = sizeof(struct frame_copy) + frame->data_len;
+	struct frame_copy *frame_copy = malloc(total_struct_length);
 
 	frame_copy->expires.tv_sec = frame->expires.tv_sec;
 	frame_copy->expires.tv_nsec = frame->expires.tv_nsec;
@@ -73,6 +136,8 @@ struct frame_copy* frame_transform(struct frame *frame) {
 
 	// copy data array
 	memcpy(frame_copy->data, frame->data, frame->data_len);
+
+	frame_copy->total_struct_length = total_struct_length;
 
 	return frame_copy;
 }
@@ -146,8 +211,13 @@ int disconnect_frame_distribution_socket() {
 
 int send_frame(struct frame_copy *frame_copy)
 {
-	struct message *message = new_message(frame_copy);
-	if(send(mysocket, message, sizeof(struct message) + frame_copy->data_len, 0) == -1) {
+	int total_struct_length = frame_copy->total_struct_length;
+	if(send(mysocket, &total_struct_length, sizeof(total_struct_length), 0) == -1) {
+		printf("Error : Send Failed \n");
+		return EXIT_FAILURE;
+	}
+
+	if(send(mysocket, frame_copy, frame_copy->total_struct_length, 0) == -1) {
 		printf("Error : Send Failed \n");
 		return EXIT_FAILURE;
 	}
@@ -155,11 +225,10 @@ int send_frame(struct frame_copy *frame_copy)
 		printf("Sent ieee80211 frame ...\n");
 	}
 
-
-	// TODO: finally!
-//	free(message);
 	return EXIT_SUCCESS;
 }
+
+
 static int index_to_rate[] = {
 	60, 90, 120, 180, 240, 360, 480, 540
 };
@@ -715,17 +784,24 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			struct frame *detransformed_frame;
 
 			transformed_frame = frame_transform(frame);
-			detransformed_frame = frame_detransform(transformed_frame);
+			if(0 > send_frame(transformed_frame)) {
+				// TODO: replace perror calls?
+				perror("Could not send frame!\n");
+				exit(1);
+			}
+
+			char buffer[BUF_SIZE];
+			struct frame_copy *frame_copy = recv_frame_copy(mysocket, buffer);
+			// TODO: free
+			detransformed_frame = frame_detransform(frame_copy);
 
 			frame = detransformed_frame;
-
 			// queue frame
 			queue_frame(frame);
-			// TODO:
-//			free(transformed_frame);
-//			free(detransformed_frame);
-			// TODO: send via socket
-			// TODO: receive incoming frames and queue them
+
+			free(transformed_frame);
+			free(frame_copy);
+
 		}
 	}
 out:

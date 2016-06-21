@@ -115,6 +115,8 @@ void station_init_queues(struct station *station);
 double get_error_prob(double snr, unsigned int rate_idx, int frame_len);
 
 struct frame_copy {
+	// TODO: make ssize_t
+	int total_struct_length;
 	struct timespec expires;	/* frame delivery (absolute) */
 	bool acked;
 	u64 cookie;
