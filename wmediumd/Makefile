@@ -47,8 +47,8 @@ CFLAGS += $(shell $(PKG_CONFIG) --cflags $(NLLIBNAME))
 NLVERSION :=$(shell $(PKG_CONFIG) --print-provides $(NLLIBNAME))
 
 CFLAGS+=-DVERSION_STR=$(VERSION_STR) -g
-LDFLAGS+=-lconfig 
-OBJECTS=wmediumd.o config.o per.o message.o# ieee80211_frame_receiver.o
+LDFLAGS+=-lconfig -lpthread
+OBJECTS=wmediumd.o config.o per.o netbuffer.o message.o# ieee80211_frame_receiver.o
 
 all: wmediumd 
 
