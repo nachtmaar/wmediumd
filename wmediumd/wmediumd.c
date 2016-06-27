@@ -59,6 +59,14 @@ static struct frame_copy static_frame_copy;
 #define SOCK_OPT_MCAST
 #define MCAST_GROUP "239.0.0.1"
 
+
+//////////////////////////////////////////////////////////////////////////////
+// Network receiving methods
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Receive exactly `cnt_bytes` bytes from the socket and store them in `buffer`
+ */
 ssize_t recv_n_bytes(int socket, char *buffer, int cnt_bytes) {
 
 	// clear buffer
@@ -73,12 +81,15 @@ ssize_t recv_n_bytes(int socket, char *buffer, int cnt_bytes) {
 	return recv_bytes;
 }
 
+/**
+ * Receive a `struct frame_copy` from the socket.
+ */
 struct frame_copy* recv_frame_copy(int socket, char *buffer) {
 	ssize_t len;
 
-	// equal to sizeof
+	// receive the header first which tells us how long the next data packet is
 	int min_byte_size = sizeof(static_frame_copy.total_struct_length);
-	printf("size of frame_copy.total_struct_length: %d\n", min_byte_size);
+	// receive header
 	len = recv_n_bytes(socket, buffer, min_byte_size);
 	if(0 < len) {
 
@@ -95,7 +106,9 @@ struct frame_copy* recv_frame_copy(int socket, char *buffer) {
 			exit(1);
 		}
 
+		// set size for data packet
 		min_byte_size = frame_len;
+		// receive data packet
 		len = recv_n_bytes(socket, buffer, min_byte_size);
 		if(len < min_byte_size) {
 			fprintf(stderr, "min byte size not received! is: %ld, was:%d)\n", len, min_byte_size);
@@ -104,7 +117,7 @@ struct frame_copy* recv_frame_copy(int socket, char *buffer) {
 		printf("Received frame length: %ld\n", len);
 
 		// get struct from buffer
-		// TODO: check every malloc call ...
+		// TODO: check every malloc call for failure ...
 		struct frame_copy *frame_copy = malloc(len);
 		memcpy(frame_copy, buffer, len);
 		printf("received frame ...\n");
@@ -121,8 +134,92 @@ struct frame_copy* recv_frame_copy(int socket, char *buffer) {
 	return NULL;
 }
 
+//////////////////////////////////////////////////////////////////////////////
+// Socket creation/connection/binding/teardown
+//////////////////////////////////////////////////////////////////////////////
 
-struct frame_copy* frame_transform(struct frame *frame) {
+int connect_frame_distribution_socket() {
+	printf("connecting socket ...\n");
+
+	// Socket address, internet style
+	struct sockaddr_in addr;
+
+#ifdef SOCK_OPT_MCAST
+	struct ip_mreq mreq;
+	mreq.imr_multiaddr.s_addr = inet_addr(MCAST_GROUP);
+	// TODO: listen only on configurable interface
+	mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+
+	// TODO: use raw socket!
+	mysocket = socket(AF_INET, SOCK_DGRAM, 0);
+
+	// disable receiving of own packets
+	int loop = 0;
+	setsockopt(mysocket, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+#else
+	mysocket = socket(AF_INET, SOCK_STREAM, 0);
+#endif
+	if(0 > mysocket) {
+		printf("Error: Could not create socket!\n");
+		return EXIT_FAILURE;
+	}
+
+	// zero struct
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	// TODO: listen only on configurable interface
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	addr.sin_port = htons(PORTNUM);
+
+#ifdef SOCK_OPT_MCAST
+	if(0 > bind(mysocket, (struct sockaddr*) &addr, sizeof(addr))) {
+#else
+		if(0 > connect(mysocket, (struct sockaddr *)&addr, sizeof(struct sockaddr))) {
+#endif
+		printf("Error : Connect Failed \n");
+		return EXIT_FAILURE;
+	}
+#ifdef SOCK_OPT_MCAST
+	else {
+		// TODO: use same var as s.addr!
+		printf("bound to %d\n", htonl(INADDR_ANY));
+	}
+	// add mcast membership
+	if (setsockopt(mysocket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+		perror("setsockopt mreq\n");
+		exit(1);
+	}
+#endif
+
+	return EXIT_SUCCESS;
+}
+
+int disconnect_frame_distribution_socket() {
+	// TODO: how to handle close and free if returned by error?
+	close(mysocket);
+	return EXIT_SUCCESS;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Frame (de)serialization
+//////////////////////////////////////////////////////////////////////////////
+
+struct station *get_sender_station_by_index(int index) {
+	struct station *cur_station;
+	list_for_each_entry(cur_station, &wmediumd->stations, list) {
+		if(cur_station->index == index) {
+			return cur_station;
+		}
+	}
+	//perror("Station not found for index: %d\n", index);
+	return NULL;
+}
+
+/**
+ * Serialize frame by copying all pointers content.
+ * The station struct is replaced by it's index.
+ */
+struct frame_copy* frame_serialize(struct frame *frame) {
 	int total_struct_length = sizeof(struct frame_copy) + frame->data_len;
 	struct frame_copy *frame_copy = malloc(total_struct_length);
 
@@ -152,18 +249,10 @@ struct frame_copy* frame_transform(struct frame *frame) {
 	return frame_copy;
 }
 
-struct station *get_sender_station_by_index(int index) {
-	struct station *cur_station;
-	list_for_each_entry(cur_station, &wmediumd->stations, list) {
-		if(cur_station->index == index) {
-			return cur_station;
-		}
-	}
-	//perror("Station not found for index: %d\n", index);
-	return NULL;
-}
-
-struct frame* frame_detransform(struct frame_copy *frame_copy) {
+/**
+ * Deserialize a frame and get the station from the index.
+ */
+struct frame* frame_deserialization(struct frame_copy *frame_copy) {
 	struct frame *frame = malloc(sizeof(struct frame) + frame_copy->data_len);
 
 	frame->expires.tv_sec = frame_copy->expires.tv_sec;
@@ -187,71 +276,10 @@ struct frame* frame_detransform(struct frame_copy *frame_copy) {
 	return frame;
 }
 
-int connect_frame_distribution_socket() {
-	printf("connecting socket ...\n");
-
-	// Socket address, internet style
-	struct sockaddr_in addr;
-
-#ifdef SOCK_OPT_MCAST
-	struct ip_mreq mreq;
-	mreq.imr_multiaddr.s_addr = inet_addr(MCAST_GROUP);
-	// TODO: listen only on configurable interface
-	mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-
-	// TODO: use raw socket!
-	mysocket = socket(AF_INET, SOCK_DGRAM, 0);
-
-	// disable receiving of own packets
-//	int loop = 0;
-//	setsockopt(mysocket, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
-#else
-	mysocket = socket(AF_INET, SOCK_STREAM, 0);
-#endif
-	if(0 > mysocket) {
-		printf("Error: Could not create socket!\n");
-		return EXIT_FAILURE;
-	}
-
-	// zero struct
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	// TODO: listen only on configurable interface
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	addr.sin_port = htons(PORTNUM);
-
-#ifdef SOCK_OPT_MCAST
-	if(0 > bind(mysocket, (struct sockaddr*) &addr, sizeof(addr))) {
-#else
-	if(0 > connect(mysocket, (struct sockaddr *)&addr, sizeof(struct sockaddr))) {
-#endif
-		printf("Error : Connect Failed \n");
-		return EXIT_FAILURE;
-	}
-#ifdef SOCK_OPT_MCAST
-	else {
-		// TODO: use same var as s.addr!
-		printf("bound to %s\n", htonl(INADDR_ANY));
-	}
-	// add mcast membership
-	if (setsockopt(mysocket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-		perror("setsockopt mreq\n");
-		exit(1);
-	}
-#endif
-
-	return EXIT_SUCCESS;
-}
-
-int disconnect_frame_distribution_socket() {
-	// TODO: how to handle close and free if returned by error?
-	close(mysocket);
-	return EXIT_SUCCESS;
-}
-
-
-// See Also: http://web.cs.wpi.edu/~claypool/courses/4514-B99/samples/multicast.c
 // TODO: convert to big-endian!
+/**
+ * Send a `frame_copy` via the network
+ */
 int send_frame(struct frame_copy *frame_copy)
 {
 	int total_struct_length = frame_copy->total_struct_length;
@@ -505,7 +533,9 @@ void queue_frame(struct frame *frame)
 	 * add the expiration time of the previous frame in the queue.
 	 */
 
+	// get 80211 qos queue
 	ac = frame_select_queue_80211(frame);
+	// add to station queue
 	queue = &station->queues[ac];
 
 	/* try to "send" this frame at each of the rates in the rateset */
@@ -687,9 +717,12 @@ void deliver_frame(struct frame *frame)
 	if (frame->flags & HWSIM_TX_STAT_ACK) {
 		/* rx the frame on the dest interface */
 		list_for_each_entry(station, &wmediumd->stations, list) {
+
+			// do not send sent packets back to the kernel
 			if (memcmp(src, station->addr, ETH_ALEN) == 0)
 				continue;
 
+			// beacon frames
 			if (is_multicast_ether_addr(dest)) {
 				int signal, rate_idx;
 				double error_prob;
@@ -714,12 +747,16 @@ void deliver_frame(struct frame *frame)
 				send_cloned_frame_msg(station,
 						      frame->data,
 						      frame->data_len,
+							  // use signal calculated by snr matrix
 						      1, signal);
 
-			} else if (memcmp(dest, station->addr, ETH_ALEN) == 0) {
+			}
+			// data frame
+			else if (memcmp(dest, station->addr, ETH_ALEN) == 0) {
 				send_cloned_frame_msg(station,
 						      frame->data,
 						      frame->data_len,
+							  // use signal from frame
 						      1, frame->signal);
 			}
 		}
@@ -778,15 +815,18 @@ int nl_err_cb(struct sockaddr_nl *nla, struct nlmsgerr *nlerr, void *arg)
 {
 	struct genlmsghdr *gnlh = nlmsg_data(&nlerr->msg);
 
-	fprintf(stderr, "nl: cmd %d, seq %d: %s\n", gnlh->cmd,
-		nlerr->msg.nlmsg_seq, strerror(abs(nlerr->error)));
+	fprintf(stderr, "nl: cmd %d, seq %d: error_code: %s, error_message: %s\n", gnlh->cmd,
+			nlerr->msg.nlmsg_seq, strerror(abs(nlerr->error)), nl_geterror(nlerr->error));
 
 	return NL_SKIP;
 }
 
+
 // TODO: libevent
 //static void process_incoming_frames(int fd, short what, void *data) {
-
+/**
+ * Receives new frames and delivers them to the kernel via `queue_frame`.
+ */
 static void process_incoming_frames() {
 	while(1) {
 
@@ -794,12 +834,14 @@ static void process_incoming_frames() {
 
 
 		char buffer[BUF_SIZE];
+		// receive frame
 		struct frame_copy *frame_copy = recv_frame_copy(mysocket, buffer);
 		if (frame_copy) {
 			struct frame *detransformed_frame;
 
 			// TODO: free
-			detransformed_frame = frame_detransform(frame_copy);
+			// deserialize it
+			detransformed_frame = frame_deserialization(frame_copy);
 
 			// queue frame
 			queue_frame(detransformed_frame);
@@ -885,7 +927,8 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 
 			struct frame_copy *transformed_frame;
 
-			transformed_frame = frame_transform(frame);
+			// send frame via network
+			transformed_frame = frame_serialize(frame);
 			if(0 > send_frame(transformed_frame)) {
 				// TODO: replace perror calls?
 				perror("Could not send frame!\n");
