@@ -705,22 +705,6 @@ void deliver_frame(struct frame *frame)
 	u8 *dest = hdr->addr1;
 	u8 *src = frame->sender->addr;
 
-
-	struct frame_copy *transformed_frame;
-	if(is_local_mac(frame->sender->hwaddr)) {
-		// send frame via network, but ignore received frames from others
-		transformed_frame = frame_serialize(frame);
-		printf("sending local frame via mcast ...\n");
-		if (0 > send_frame(transformed_frame)) {
-			// TODO: replace perror calls?
-			perror("Could not send frame!\n");
-			exit(1);
-		}
-	}
-	else {
-		printf("copying frame to local wifi interface ...\n");
-	}
-
 	if (frame->flags & HWSIM_TX_STAT_ACK) {
 		// for each station copy the frame
 		/* rx the frame on the dest interface */
@@ -771,12 +755,8 @@ void deliver_frame(struct frame *frame)
 		}
 	}
 
-	if(is_local_mac(frame->sender->hwaddr)) {
-		printf("sending tx_info to kernel for local frame ...\n");
-		
-		send_tx_info_frame_nl(frame->sender, frame->flags,
-							  frame->signal, frame->tx_rates, frame->cookie);
-	}
+	send_tx_info_frame_nl(frame->sender, frame->flags,
+						  frame->signal, frame->tx_rates, frame->cookie);
 
 	free(frame);
 }
@@ -942,7 +922,18 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			       min(tx_rates_len, sizeof(frame->tx_rates)));
 
 			queue_frame(frame);
+
+			struct frame_copy *transformed_frame;
+			// send frame via network, but ignore received frames from others
+			transformed_frame = frame_serialize(frame);
+			printf("sending local frame via mcast ...\n");
+			if (0 > send_frame(transformed_frame)) {
+				// TODO: replace perror calls?
+				perror("Could not send frame!\n");
+				exit(1);
+			}
 		}
+
 	}
 	out:
 	return 0;
