@@ -296,12 +296,6 @@ int send_frame(struct frame_copy *frame_copy)
 	addr.sin_addr.s_addr = inet_addr(MCAST_GROUP);
 	addr.sin_port = htons(PORTNUM);
 
-	// send length of next packet
-	if(0 >= sendto(mysocket, &total_struct_length, sizeof(total_struct_length), 0, (struct sockaddr*) &addr, sizeof(addr))) {
-		printf("Error : Send Failed \n");
-		return EXIT_FAILURE;
-	}
-
 	// send actual payload
 	if(0 >= sendto(mysocket, frame_copy, frame_copy->total_struct_length, 0, (struct sockaddr*) &addr, sizeof(addr)))  {
 		printf("Error : Send Failed \n");
