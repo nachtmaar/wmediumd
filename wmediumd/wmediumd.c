@@ -47,91 +47,68 @@
 #include <pthread.h>
 
 #include "message.h"
-#include "netbuffer.h"
 
 
-#define BUF_SIZE 8192
+#define BUF_SIZE 65507
 static struct wmediumd *wmediumd;
 
-static struct frame_copy static_frame_copy;
 
 // otherwise use TCP!
 #define SOCK_OPT_MCAST
 #define MCAST_GROUP "239.0.0.1"
 
+#define MODE_DISTRIBUTED
+
+// TODO: make more generic
+bool is_local_mac(uint8_t *mac) {
+
+	FILE *fd;
+
+	uint8_t mac_addr[6];
+	unsigned int values[6];
+
+	char *path_to_mac_addr = "/sys/class/net/wlan0/address";
+	fd = fopen(path_to_mac_addr, "r");
+	if (fd == NULL) {
+		fprintf(stderr, "Could not open '%s'\n", path_to_mac_addr);
+		exit(1);
+	}
+
+	fscanf(fd, "%X:%X:%X:%X:%X:%X", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]);
+	/* convert to uint8_t */
+	for( int i = 0; i < 6; ++i ) {
+		mac_addr[i] = (uint8_t) values[i];
+	}
+
+	fclose(fd);
+	return memcmp(mac, mac_addr, 6) == 0;
+}
 
 //////////////////////////////////////////////////////////////////////////////
 // Network receiving methods
 //////////////////////////////////////////////////////////////////////////////
 
-/**
- * Receive exactly `cnt_bytes` bytes from the socket and store them in `buffer`
- */
-ssize_t recv_n_bytes(int socket, char *buffer, int cnt_bytes) {
-
-	// clear buffer
-	memset(buffer, 0, BUF_SIZE);
-
-	// TODO: check MSG_WAITALL flag!
-	// SO_RCVLOWAT: set minimum count for input
-	setsockopt(socket, SOL_SOCKET, SO_RCVLOWAT, &cnt_bytes, sizeof(cnt_bytes));
-
-	ssize_t recv_bytes = recv(socket, buffer, cnt_bytes, 0);
-
-	return recv_bytes;
-}
 
 /**
  * Receive a `struct frame_copy` from the socket.
  */
-struct frame_copy* recv_frame_copy(int socket, char *buffer) {
+struct frame_copy* recv_frame_copy(int socket, char *buffer, ssize_t buf_size) {
 	ssize_t len;
 
-	// receive the header first which tells us how long the next data packet is
-	int min_byte_size = sizeof(static_frame_copy.total_struct_length);
-	// receive header
-	len = recv_n_bytes(socket, buffer, min_byte_size);
-	if(0 < len) {
-
-		printf("Received %ld bytes\n", len);
-
-		// copy received length
-		int frame_len;
-		assert(min_byte_size == sizeof(unsigned int));
-
-		memcpy(&frame_len, buffer, min_byte_size);
-		printf("Frame length: %d\n", frame_len);
-		if(BUF_SIZE < frame_len) {
-			fprintf(stderr, "Frame length too big: %d! Buffer size: %d)\n", frame_len, BUF_SIZE);
-			exit(1);
-		}
-
-		// set size for data packet
-		min_byte_size = frame_len;
-		// receive data packet
-		len = recv_n_bytes(socket, buffer, min_byte_size);
-		if(len < min_byte_size) {
-			fprintf(stderr, "min byte size not received! is: %ld, was:%d)\n", len, min_byte_size);
-			exit(1);
-		}
-		printf("Received frame length: %ld\n", len);
-
-		// get struct from buffer
-		// TODO: check every malloc call for failure ...
-		struct frame_copy *frame_copy = malloc(len);
-		memcpy(frame_copy, buffer, len);
-		printf("received frame ...\n");
-
-		return frame_copy;
+	len = recv(socket, buffer, buf_size, 0);
+	if(0 >= len) {
+		fprintf(stderr, "socket EOF!\n");
+		exit(1);
 	}
+	printf("Received frame length: %ld\n", len);
 
-	// EOL
-	else {
-		printf("EOL\n");
-		exit(0);
-	}
+	// get struct from buffer
+	// TODO: check every malloc call for failure ...
+	struct frame_copy *frame_copy = malloc(len);
+	memcpy(frame_copy, buffer, len);
+	printf("received frame ...\n");
 
-	return NULL;
+	return frame_copy;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -156,11 +133,12 @@ int connect_frame_distribution_socket() {
 	// disable receiving of own packets
 	int loop = 0;
 	setsockopt(mysocket, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+
 #else
 	mysocket = socket(AF_INET, SOCK_STREAM, 0);
 #endif
 	if(0 > mysocket) {
-		printf("Error: Could not create socket!\n");
+		fprintf(stderr, "Error: Could not create socket!\n");
 		return EXIT_FAILURE;
 	}
 
@@ -176,13 +154,13 @@ int connect_frame_distribution_socket() {
 #else
 		if(0 > connect(mysocket, (struct sockaddr *)&addr, sizeof(struct sockaddr))) {
 #endif
-		printf("Error : Connect Failed \n");
+		fprintf(stderr, "Error : Connect Failed \n");
 		return EXIT_FAILURE;
 	}
 #ifdef SOCK_OPT_MCAST
 	else {
 		// TODO: use same var as s.addr!
-		printf("bound to %d\n", htonl(INADDR_ANY));
+		fprintf(stderr, "bound to %d\n", htonl(INADDR_ANY));
 	}
 	// add mcast membership
 	if (setsockopt(mysocket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
@@ -211,6 +189,7 @@ struct station *get_sender_station_by_index(int index) {
 			return cur_station;
 		}
 	}
+
 	//perror("Station not found for index: %d\n", index);
 	return NULL;
 }
@@ -265,6 +244,9 @@ struct frame* frame_deserialization(struct frame_copy *frame_copy) {
 	frame->tx_rates_count = frame_copy->tx_rates_count;
 	// copy index of station instead of whole structure
 	frame->sender = get_sender_station_by_index(frame_copy->sender);
+	if(!frame->sender) {
+		fprintf(stderr, "frame_deserialization: \n");
+	}
 
 	for(int i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
 		frame->tx_rates[i] = frame_copy->tx_rates[i];
@@ -282,7 +264,6 @@ struct frame* frame_deserialization(struct frame_copy *frame_copy) {
  */
 int send_frame(struct frame_copy *frame_copy)
 {
-	int total_struct_length = frame_copy->total_struct_length;
 
 #ifdef SOCK_OPT_MCAST
 
@@ -298,7 +279,7 @@ int send_frame(struct frame_copy *frame_copy)
 
 	// send actual payload
 	if(0 >= sendto(mysocket, frame_copy, frame_copy->total_struct_length, 0, (struct sockaddr*) &addr, sizeof(addr)))  {
-		printf("Error : Send Failed \n");
+		fprintf(stderr, "Error : Send Failed \n");
 		return EXIT_FAILURE;
 	}
 	else {
@@ -306,11 +287,6 @@ int send_frame(struct frame_copy *frame_copy)
 	}
 
 #else
-	// send length of next packet
-	if(0 >= send(mysocket, &total_struct_length, sizeof(frame_copy->total_struct_length), 0)) {
-		printf("Error : Send Failed \n");
-		return EXIT_FAILURE;
-	}
 
 	// send actual payload
 	if(0 >= send(mysocket, frame_copy, frame_copy->total_struct_length, 0)) {
@@ -326,6 +302,7 @@ int send_frame(struct frame_copy *frame_copy)
 }
 
 
+# define index_to_rate_size 8
 static int index_to_rate[] = {
 	60, 90, 120, 180, 240, 360, 480, 540
 };
@@ -537,12 +514,18 @@ void queue_frame(struct frame *frame)
 	cw = queue->cw_min;
 
 	int snr = SNR_DEFAULT;
-
+	
 	if (!is_multicast_ether_addr(dest)) {
-		struct station *deststa = get_station_by_addr(dest);
-		if (deststa)
+		struct station *deststa;
+		deststa = get_station_by_addr(dest);
+		if (deststa) {
 			snr = get_link_snr(station, deststa);
+		}
+		else {
+			fprintf(stderr, "Station not found!\n");
+		}
 	}
+
 	frame->signal = snr;
 
 	noack = frame_is_mgmt(frame) || is_multicast_ether_addr(dest);
@@ -558,6 +541,13 @@ void queue_frame(struct frame *frame)
 
 		error_prob = get_error_prob(snr, rate_idx, frame->data_len);
 		for (j = 0; j < frame->tx_rates[i].count; j++) {
+
+			if(rate_idx > index_to_rate_size -1) {
+
+				fprintf(stderr, "Invalid rate_idx!\n");
+				rate_idx = index_to_rate_size -1;
+			}
+
 			int rate = index_to_rate[rate_idx];
 			send_time += difs + pkt_duration(frame->data_len, rate);
 
@@ -625,40 +615,47 @@ int send_tx_info_frame_nl(struct station *src,
 			  struct hwsim_tx_rate *tx_attempts,
 			  u64 cookie)
 {
-	struct nl_sock *sock = wmediumd->sock;
-	struct nl_msg *msg;
 
-	msg = nlmsg_alloc();
-	if (!msg) {
-		printf("Error allocating new message MSG!\n");
-		goto out;
+	if(is_local_mac(src->hwaddr)) {
+		struct nl_sock *sock = wmediumd->sock;
+		struct nl_msg *msg;
+
+		msg = nlmsg_alloc();
+		if (!msg) {
+			printf("Error allocating new message MSG!\n");
+			goto out;
+		}
+
+		genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(wmediumd->family),
+					0, NLM_F_REQUEST, HWSIM_CMD_TX_INFO_FRAME, VERSION_NR);
+
+		int rc;
+
+		rc = nla_put(msg, HWSIM_ATTR_ADDR_TRANSMITTER, ETH_ALEN, src->hwaddr);
+		rc = nla_put_u32(msg, HWSIM_ATTR_FLAGS, flags);
+		rc = nla_put_u32(msg, HWSIM_ATTR_SIGNAL, signal);
+		rc = nla_put(msg, HWSIM_ATTR_TX_INFO,
+					 IEEE80211_TX_MAX_RATES * sizeof(struct hwsim_tx_rate),
+					 tx_attempts);
+
+		rc = nla_put_u64(msg, HWSIM_ATTR_COOKIE, cookie);
+
+		if (rc != 0) {
+			printf("Error filling payload\n");
+			goto out;
+		}
+
+		nl_send_auto_complete(sock, msg);
+		nlmsg_free(msg);
+		return 0;
+		out:
+		nlmsg_free(msg);
+		return -1;
 	}
-
-	genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(wmediumd->family),
-		    0, NLM_F_REQUEST, HWSIM_CMD_TX_INFO_FRAME, VERSION_NR);
-
-	int rc;
-
-	rc = nla_put(msg, HWSIM_ATTR_ADDR_TRANSMITTER, ETH_ALEN, src->hwaddr);
-	rc = nla_put_u32(msg, HWSIM_ATTR_FLAGS, flags);
-	rc = nla_put_u32(msg, HWSIM_ATTR_SIGNAL, signal);
-	rc = nla_put(msg, HWSIM_ATTR_TX_INFO,
-		     IEEE80211_TX_MAX_RATES * sizeof(struct hwsim_tx_rate),
-		     tx_attempts);
-
-	rc = nla_put_u64(msg, HWSIM_ATTR_COOKIE, cookie);
-
-	if (rc != 0) {
-		printf("Error filling payload\n");
-		goto out;
+	else {
+		printf("No local tx info!\n");
 	}
-
-	nl_send_auto_complete(sock, msg);
-	nlmsg_free(msg);
 	return 0;
-out:
-	nlmsg_free(msg);
-	return -1;
 }
 
 /*
@@ -708,8 +705,26 @@ void deliver_frame(struct frame *frame)
 	u8 *dest = hdr->addr1;
 	u8 *src = frame->sender->addr;
 
+
+	struct frame_copy *transformed_frame;
+	if(is_local_mac(frame->sender->hwaddr)) {
+		// send frame via network, but ignore received frames from others
+		transformed_frame = frame_serialize(frame);
+		printf("sending local frame via mcast ...\n");
+		if (0 > send_frame(transformed_frame)) {
+			// TODO: replace perror calls?
+			perror("Could not send frame!\n");
+			exit(1);
+		}
+	}
+	else {
+		printf("copying frame to local wifi interface ...\n");
+	}
+
 	if (frame->flags & HWSIM_TX_STAT_ACK) {
+		// for each station copy the frame
 		/* rx the frame on the dest interface */
+		// TODO: we have only one interface in the distributed mode! therefore we can save performance here!
 		list_for_each_entry(station, &wmediumd->stations, list) {
 
 			// do not send sent packets back to the kernel
@@ -756,8 +771,12 @@ void deliver_frame(struct frame *frame)
 		}
 	}
 
-	send_tx_info_frame_nl(frame->sender, frame->flags,
-			      frame->signal, frame->tx_rates, frame->cookie);
+	if(is_local_mac(frame->sender->hwaddr)) {
+		printf("sending tx_info to kernel for local frame ...\n");
+		
+		send_tx_info_frame_nl(frame->sender, frame->flags,
+							  frame->signal, frame->tx_rates, frame->cookie);
+	}
 
 	free(frame);
 }
@@ -785,21 +804,29 @@ void deliver_expired_frames(struct wmediumd *ctx)
 	int i;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	// TODO: we have only one station
 	list_for_each_entry(station, &ctx->stations, list) {
-		int q_ct[IEEE80211_NUM_ACS] = {};
-		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
-			list_for_each(l, &station->queues[i].frames) {
-				q_ct[i]++;
-			}
-		}
-		printf("[" TIME_FMT "] Station " MAC_FMT
-		       " BK %d BE %d VI %d VO %d\n",
-		       TIME_ARGS(&now), MAC_ARGS(station->addr),
-		       q_ct[IEEE80211_AC_BK], q_ct[IEEE80211_AC_BE],
-		       q_ct[IEEE80211_AC_VI], q_ct[IEEE80211_AC_VO]);
 
-		for (i = 0; i < IEEE80211_NUM_ACS; i++)
-			deliver_expired_frames_queue(&station->queues[i].frames, &now);
+		// TODO: needs to be copied to each station!
+//		if(is_local_mac(station->hwaddr)) {
+			int q_ct[IEEE80211_NUM_ACS] = {};
+			for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+				list_for_each(l, &station->queues[i].frames) {
+					q_ct[i]++;
+				}
+			}
+			printf("[" TIME_FMT "] Station " MAC_FMT
+						   " BK %d BE %d VI %d VO %d\n",
+				   TIME_ARGS(&now), MAC_ARGS(station->addr),
+				   q_ct[IEEE80211_AC_BK], q_ct[IEEE80211_AC_BE],
+				   q_ct[IEEE80211_AC_VI], q_ct[IEEE80211_AC_VO]);
+
+			for (i = 0; i < IEEE80211_NUM_ACS; i++)
+				deliver_expired_frames_queue(&station->queues[i].frames, &now);
+//		}
+//		else {
+//			printf("skipping deliver_expired_frames for non-local station ...\n");
+//		}
 	}
 	printf("\n\n");
 }
@@ -826,25 +853,20 @@ static void process_incoming_frames() {
 
 		printf("process_incoming_frames ...\n");
 
-
 		char buffer[BUF_SIZE];
 		// receive frame
-		struct frame_copy *frame_copy = recv_frame_copy(mysocket, buffer);
-		if (frame_copy) {
-			struct frame *detransformed_frame;
+		struct frame_copy *frame_copy = recv_frame_copy(mysocket, buffer, BUF_SIZE);
 
-			// TODO: free
-			// deserialize it
-			detransformed_frame = frame_deserialization(frame_copy);
+		struct frame *detransformed_frame;
 
-			// queue frame
-			queue_frame(detransformed_frame);
+		// TODO: free
+		// deserialize it
+		detransformed_frame = frame_deserialization(frame_copy);
 
-			free(frame_copy);
-		}
-		else {
-			printf("Not enough bytes received ...\n");
-		}
+		// queue frame
+		queue_frame(detransformed_frame);
+
+		free(frame_copy);
 	}
 }
 
@@ -873,7 +895,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 		/* we get the attributes from `nlh` */
 		genlmsg_parse(nlh, 0, attrs, HWSIM_ATTR_MAX, NULL);
 		if (attrs[HWSIM_ATTR_ADDR_TRANSMITTER]) {
-			
+
 			// put items from `attrs` into local vars
 			u8 *hwaddr = (u8 *)nla_data(attrs[HWSIM_ATTR_ADDR_TRANSMITTER]);
 			unsigned int data_len =
@@ -896,6 +918,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 				goto out;
 
 			// create sender struct
+			// TODO:
 			sender = get_station_by_addr(src);
 			if (!sender) {
 				fprintf(stderr, "Unable to find sender station " MAC_FMT "\n", MAC_ARGS(src));
@@ -907,7 +930,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			if (!frame)
 				goto out;
 
-			// envelope ieee 80211 frame
+			// envelope IEEE 802.11 frame
 			memcpy(frame->data, data, data_len);
 			frame->data_len = data_len;
 			frame->flags = flags;
@@ -918,22 +941,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			memcpy(frame->tx_rates, tx_rates,
 			       min(tx_rates_len, sizeof(frame->tx_rates)));
 
-
-			struct frame_copy *transformed_frame;
-
-			// send frame via network
-			transformed_frame = frame_serialize(frame);
-			if(0 > send_frame(transformed_frame)) {
-				// TODO: replace perror calls?
-				perror("Could not send frame!\n");
-				exit(1);
-			}
-
-//			process_incoming_frames();
-			// TODO: enable again ? how to handle duplicate packets??
-//			queue_frame(frame);
-			// TODO:
-//			free(transformed_frame);
+			queue_frame(frame);
 		}
 	}
 	out:
@@ -950,7 +958,7 @@ int send_register_msg()
 
 	msg = nlmsg_alloc();
 	if (!msg) {
-		printf("Error allocating new message MSG!\n");
+		fprintf(stderr, "Error allocating new message MSG!\n");
 		return -1;
 	}
 
@@ -977,13 +985,13 @@ void init_netlink()
 
 	wmediumd->cb = nl_cb_alloc(NL_CB_CUSTOM);
 	if (!wmediumd->cb) {
-		printf("Error allocating netlink callbacks\n");
+		fprintf(stderr, "Error allocating netlink callbacks\n");
 		exit(EXIT_FAILURE);
 	}
 
 	sock = nl_socket_alloc_cb(wmediumd->cb);
 	if (!sock) {
-		printf("Error allocating netlink socket\n");
+		fprintf(stderr, "Error allocating netlink socket\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -995,7 +1003,7 @@ void init_netlink()
 	wmediumd->family = genl_ctrl_search_by_name(wmediumd->cache, "MAC80211_HWSIM");
 
 	if (!wmediumd->family) {
-		printf("Family MAC80211_HWSIM not registered\n");
+		fprintf(stderr, "Family MAC80211_HWSIM not registered\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -1035,7 +1043,7 @@ int main(int argc, char *argv[])
 	struct event ev_timer;
 	struct wmediumd ctx;
 	wmediumd = &ctx;
-	
+
 	char *config_file = NULL;
 
 	setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
@@ -1077,7 +1085,7 @@ int main(int argc, char *argv[])
 		print_help(EXIT_FAILURE);
 
 	if (!config_file) {
-		printf("%s: config file must be supplied\n", argv[0]);
+		fprintf(stderr, "%s: config file must be supplied\n", argv[0]);
 		print_help(EXIT_FAILURE);
 	}
 
@@ -1088,7 +1096,7 @@ int main(int argc, char *argv[])
 	event_init();
 
 	if(connect_frame_distribution_socket() == EXIT_FAILURE) {
-		printf("Could not open frame distribution channel!\n");
+		fprintf(stderr, "Could not open frame distribution channel!\n");
 		return EXIT_FAILURE;
 	}
 
