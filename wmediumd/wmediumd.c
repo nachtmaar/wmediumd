@@ -667,7 +667,7 @@ int send_tx_info_frame_nl(struct station *src,
  * Send a data frame to the kernel for reception at a specific radio.
  */
 int send_cloned_frame_msg(struct station *dst,
-			  u8 *data, int data_len, int rate_idx, int signal)
+			  u8 *data, int data_len, int signal)
 {
 	struct nl_msg *msg;
 	struct nl_sock *sock = wmediumd->sock;
@@ -695,7 +695,7 @@ int send_cloned_frame_msg(struct station *dst,
 	printf("cloned msg dest " MAC_FMT " (radio: " MAC_FMT ") len %d\n",
 	       MAC_ARGS(dst->addr), MAC_ARGS(dst->hwaddr), data_len);
 
-	nl_send_auto_complete(sock, msg);
+	nl_send_auto(sock, msg);
 	nlmsg_free(msg);
 	return 0;
 out:
@@ -719,6 +719,10 @@ void deliver_frame(struct frame *frame)
 			// do not send sent packets back to the kernel
 			if (memcmp(src, station->addr, ETH_ALEN) == 0)
 				continue;
+
+			// necessary to prevent netlink errors
+			if(!is_local_mac(station->addr))
+				break;
 
 			// beacon frames
 			if (is_multicast_ether_addr(dest)) {
@@ -748,6 +752,7 @@ void deliver_frame(struct frame *frame)
 						      frame->data_len,
 							  // use signal calculated by snr matrix
 						      1, signal);
+						      signal);
 
 			}
 			// data frame
@@ -756,13 +761,13 @@ void deliver_frame(struct frame *frame)
 						      frame->data,
 						      frame->data_len,
 							  // use signal from frame
-						      1, frame->signal);
+						      frame->signal);
 			}
 		}
 	}
-
 	send_tx_info_frame_nl(frame->sender, frame->flags,
 						  frame->signal, frame->tx_rates, frame->cookie);
+
 
 	free(frame);
 }
