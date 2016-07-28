@@ -53,6 +53,8 @@
 static struct wmediumd *wmediumd;
 
 
+#define PERFECT_CHANNEL
+
 // otherwise use TCP!
 #define SOCK_OPT_MCAST
 #define MCAST_GROUP "239.0.0.1"
@@ -376,7 +378,9 @@ void rearm_timer()
 			frame = list_first_entry_or_null(&station->queues[i].frames,
 							 struct frame, list);
 
+			// find earliest frame expiration time
 			if (frame && (!set_min_expires ||
+					  // frame expires before current min_expires ?
 				      timespec_before(&frame->expires,
 						      &min_expires))) {
 				set_min_expires = true;
@@ -385,6 +389,7 @@ void rearm_timer()
 		}
 	}
 	expires.it_value = min_expires;
+	// arm timer at expires->it_value
 	timerfd_settime(wmediumd->timerfd, TFD_TIMER_ABSTIME, &expires, NULL);
 }
 
@@ -514,7 +519,7 @@ void queue_frame(struct frame *frame)
 	cw = queue->cw_min;
 
 	int snr = SNR_DEFAULT;
-	
+
 	if (!is_multicast_ether_addr(dest)) {
 		struct station *deststa;
 		deststa = get_station_by_addr(dest);
@@ -726,7 +731,8 @@ void deliver_frame(struct frame *frame)
 				 * each receiver.
 				 */
 				signal = get_link_snr(station, frame->sender);
-				rate_idx = frame->tx_rates[0].idx;
+				// TODO:
+				rate_idx = index_to_rate[index_to_rate_size];
 				error_prob = get_error_prob((double)signal,
 							    rate_idx, frame->data_len);
 
@@ -790,6 +796,7 @@ void deliver_expired_frames(struct wmediumd *ctx)
 		// TODO: needs to be copied to each station!
 //		if(is_local_mac(station->hwaddr)) {
 			int q_ct[IEEE80211_NUM_ACS] = {};
+			// iterate over wlan queues
 			for (i = 0; i < IEEE80211_NUM_ACS; i++) {
 				list_for_each(l, &station->queues[i].frames) {
 					q_ct[i]++;
@@ -924,6 +931,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			queue_frame(frame);
 
 			struct frame_copy *transformed_frame;
+			// TODO: do not send local frames?
 			// send frame via network, but ignore received frames from others
 			transformed_frame = frame_serialize(frame);
 			printf("sending local frame via mcast ...\n");
@@ -998,6 +1006,7 @@ void init_netlink()
 		exit(EXIT_FAILURE);
 	}
 
+	// register methods to be called for netlink events
 	nl_cb_set(wmediumd->cb, NL_CB_MSG_IN, NL_CB_CUSTOM, process_messages_cb, wmediumd);
 	nl_cb_err(wmediumd->cb, NL_CB_CUSTOM, nl_err_cb, wmediumd);
 }
