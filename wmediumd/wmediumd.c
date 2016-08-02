@@ -751,7 +751,6 @@ void deliver_frame(struct frame *frame)
 						      frame->data,
 						      frame->data_len,
 							  // use signal calculated by snr matrix
-						      1, signal);
 						      signal);
 
 			}
