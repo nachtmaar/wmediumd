@@ -550,11 +550,6 @@ static enum ieee80211_ac_number frame_select_queue_80211(struct frame *frame)
 	return ieee802_1d_to_ac[priority];
 }
 
-bool is_multicast_ether_addr(const u8 *addr)
-{
-	return 0x01 & addr[0];
-}
-
 static struct station *get_station_by_addr(u8 *addr)
 {
 	struct station *station;
