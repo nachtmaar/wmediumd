@@ -48,6 +48,8 @@
 
 #include "message.h"
 
+// TODO:
+#define PDU 1400
 
 #define BUF_SIZE 65507
 static struct wmediumd *wmediumd;
@@ -60,6 +62,11 @@ static struct wmediumd *wmediumd;
 #define MCAST_GROUP "239.0.0.1"
 
 #define MODE_DISTRIBUTED
+
+bool is_multicast_ether_addr(const u8 *addr)
+{
+	return 0x01 & addr[0];
+}
 
 // TODO: make more generic
 bool is_local_mac(uint8_t *mac) {
@@ -90,11 +97,10 @@ bool is_local_mac(uint8_t *mac) {
 // Network receiving methods
 //////////////////////////////////////////////////////////////////////////////
 
-
 /**
  * Receive a `struct frame_copy` from the socket.
  */
-struct frame_copy* recv_frame_copy(int socket, char *buffer, ssize_t buf_size) {
+char* recv_frames(int socket, char *buffer, ssize_t buf_size) {
 	ssize_t len;
 
 	len = recv(socket, buffer, buf_size, 0);
@@ -104,14 +110,30 @@ struct frame_copy* recv_frame_copy(int socket, char *buffer, ssize_t buf_size) {
 	}
 	printf("Received frame length: %ld\n", len);
 
-	// get struct from buffer
-	// TODO: check every malloc call for failure ...
-	struct frame_copy *frame_copy = malloc(len);
-	memcpy(frame_copy, buffer, len);
-	printf("received frame ...\n");
-
-	return frame_copy;
+	return buffer;
 }
+
+///**
+// * Receive a `struct frame_copy` from the socket.
+// */
+//struct frame_copy** recv_frame_copy(int socket, char *buffer, ssize_t buf_size) {
+//	ssize_t len;
+//
+//	len = recv(socket, buffer, buf_size, 0);
+//	if(0 >= len) {
+//		fprintf(stderr, "socket EOF!\n");
+//		exit(1);
+//	}
+//	printf("Received frame length: %ld\n", len);
+//
+//	// get struct from buffer
+//	// TODO: check every malloc call for failure ...
+//	struct frame_copy *frame_copy = malloc(len);
+//	memcpy(frame_copy, buffer, len);
+//	printf("received frame ...\n");
+//
+//	return frame_copy;
+//}
 
 //////////////////////////////////////////////////////////////////////////////
 // Socket creation/connection/binding/teardown
@@ -260,6 +282,53 @@ struct frame* frame_deserialization(struct frame_copy *frame_copy) {
 	return frame;
 }
 
+static char buffer[PDU];
+static int buf_size = 0;
+
+typedef unsigned char buffer_len;
+
+#define END_OF_BUFFER 0
+
+/**
+ * Fill the buffer and return the new buffer size. -1 if buffer full.
+ *
+ */
+ssize_t fill_buffer(char *data, buffer_len byte_len) {
+
+	// append END_OF_BUFFER
+	if(buf_size + byte_len + 1 >= PDU) {
+		//buffer[buf_size] = END_OF_BUFFER;
+		// include at least one END_OF_BUFFER
+		buf_size += 1;
+		return 	-1;
+	}
+	else {
+
+		// include length of following data
+		buffer[buf_size] = byte_len;
+		buf_size += 1;
+
+		// append data to buffer
+		memcpy(buffer + buf_size, data, byte_len);
+		buf_size += byte_len;
+
+		fprintf(stderr, "buffer_fill: %d\n", buf_size);
+		return buf_size;
+	}
+}
+
+void clear_buffer() {
+	buf_size = 0;
+	// clear buffer
+	memset(buffer, END_OF_BUFFER, PDU);
+}
+
+bool is_multicast_frame(struct frame_copy *frame_copy) {
+	struct ieee80211_hdr *hdr = (void *) frame_copy->data;
+	u8 *dest = hdr->addr1;
+	return is_multicast_ether_addr(dest);
+}
+
 // TODO: convert to big-endian!
 /**
  * Send a `frame_copy` via the network
@@ -270,7 +339,7 @@ int send_frame(struct frame_copy *frame_copy)
 #ifdef SOCK_OPT_MCAST
 
 	struct sockaddr_in addr;
-
+	ssize_t bytes_to_send = frame_copy->total_struct_length;
 	// configure addr struct
 	// zero struct
 	// TODO: reuse addr struct! refactoring!
@@ -279,20 +348,51 @@ int send_frame(struct frame_copy *frame_copy)
 	addr.sin_addr.s_addr = inet_addr(MCAST_GROUP);
 	addr.sin_port = htons(PORTNUM);
 
-	// send actual payload
-	if(0 >= sendto(mysocket, frame_copy, frame_copy->total_struct_length, 0, (struct sockaddr*) &addr, sizeof(addr)))  {
-		fprintf(stderr, "Error : Send Failed \n");
-		return EXIT_FAILURE;
+	// beacon frames
+	if (is_multicast_frame(frame_copy)) {
+		printf("sending baecon (%d) via mcast ...\n", frame_copy->total_struct_length);
+
+		int frame_size = frame_copy->total_struct_length + 1;
+		char buffer[frame_size];
+		buffer[0] = frame_copy->total_struct_length;
+		memcpy(buffer+1, frame_copy, frame_copy->total_struct_length);
+
+		if (0 >= sendto(mysocket, buffer, frame_size, 0, (struct sockaddr *) &addr, sizeof(addr))) {
+			perror("Error : Send Failed");
+			return EXIT_FAILURE;
+		}
+		else {
+			printf("Sent ieee80211 frame ...\n");
+		}
+		// TODO:
+		//free(frame_copy_with_length);
 	}
 	else {
-		printf("Sent ieee80211 frame ...\n");
-	}
+		// send the full buffer and clear it afterwards
+		if (-1 == fill_buffer((char *) frame_copy, (buffer_len) bytes_to_send)) {
 
+			// send actual payload
+			printf("sending local frame (%d) via mcast ...\n", buf_size);
+			if (0 >= sendto(mysocket, buffer, buf_size, 0, (struct sockaddr *) &addr, sizeof(addr))) {
+				perror("Error : Send Failed");
+				return EXIT_FAILURE;
+			}
+			else {
+				printf("Sent ieee80211 frame ...\n");
+			}
+			clear_buffer();
+
+		}
+			// add data to empty buffer
+		else {
+			fill_buffer((char *) frame_copy, bytes_to_send);
+		}
+	}
 #else
 
 	// send actual payload
 	if(0 >= send(mysocket, frame_copy, frame_copy->total_struct_length, 0)) {
-		printf("Error : Send Failed \n");
+		perror("Error : Send Failed");
 		return EXIT_FAILURE;
 	}
 	else {
@@ -716,6 +816,11 @@ void deliver_frame(struct frame *frame)
 		// TODO: we have only one interface in the distributed mode! therefore we can save performance here!
 		list_for_each_entry(station, &wmediumd->stations, list) {
 
+			// we have only one local station!
+			// necessary to prevent netlink errors (code 2)
+			if(!is_local_mac(station->addr))
+				continue;
+
 			// do not send sent packets back to the kernel
 			if (memcmp(src, station->addr, ETH_ALEN) == 0)
 				continue;
@@ -767,6 +872,12 @@ void deliver_frame(struct frame *frame)
 	send_tx_info_frame_nl(frame->sender, frame->flags,
 						  frame->signal, frame->tx_rates, frame->cookie);
 
+	// necessary to prevent netlink errors (code 3)
+	if(is_local_mac(src)) {
+
+		send_tx_info_frame_nl(frame->sender, frame->flags,
+							  frame->signal, frame->tx_rates, frame->cookie);
+	}
 
 	free(frame);
 }
@@ -778,6 +889,7 @@ void deliver_expired_frames_queue(struct list_head *queue,
 
 	list_for_each_entry_safe(frame, tmp, queue, list) {
 		if (timespec_before(&frame->expires, now)) {
+			// deliver frame and remove it from the queue
 			list_del(&frame->list);
 			deliver_frame(frame);
 		} else {
@@ -840,24 +952,52 @@ int nl_err_cb(struct sockaddr_nl *nla, struct nlmsgerr *nlerr, void *arg)
  * Receives new frames and delivers them to the kernel via `queue_frame`.
  */
 static void process_incoming_frames() {
+
 	while(1) {
 
 		printf("process_incoming_frames ...\n");
 
-		char buffer[BUF_SIZE];
-		// receive frame
-		struct frame_copy *frame_copy = recv_frame_copy(mysocket, buffer, BUF_SIZE);
+		char buffer[PDU];
+		// receive frame(s)
+		recv_frames(mysocket, buffer, PDU);
 
-		struct frame *detransformed_frame;
+		// pointer in stream
+		ssize_t offset = 0;
 
-		// TODO: free
-		// deserialize it
-		detransformed_frame = frame_deserialization(frame_copy);
+		// demultiplex frame(s)
+		while(1) {
+			buffer_len len = buffer[offset];
 
-		// queue frame
-		queue_frame(detransformed_frame);
+			if((char)len == END_OF_BUFFER) {
+				break;
+			}
 
-		free(frame_copy);
+			offset += 1;
+
+			struct frame_copy *frame_copy = malloc(len);
+			// copy frame from buffer
+			memcpy(frame_copy, buffer + offset, len);
+
+			offset += len;
+
+			struct frame *detransformed_frame;
+
+			// TODO: free
+			// deserialize it
+			detransformed_frame = frame_deserialization(frame_copy);
+
+			// queue frame
+			queue_frame(detransformed_frame);
+
+			free(frame_copy);
+
+			// received baecon -> enter while loop again
+			if(is_multicast_frame(frame_copy)) {
+				printf("received baecon ...\n");
+				break;
+			}
+		}
+
 	}
 }
 
