@@ -21,6 +21,9 @@
  *	02110-1301, USA.
  */
 
+#define PERFECT_CHANNEL
+#define PERFECT_CHANNEL_NO_QUEUES
+
 #ifndef WMEDIUMD_H_
 #define WMEDIUMD_H_
 
@@ -90,13 +93,31 @@ struct wqueue {
 };
 
 struct station {
-	int index;
+	unsigned int index;
 	u8 addr[ETH_ALEN];		/* virtual interface mac address */
 	u8 hwaddr[ETH_ALEN];		/* hardware address of hwsim radio */
 	struct wqueue queues[IEEE80211_NUM_ACS];
 	struct list_head list;
 };
 
+// TODO: use system independent sizes!
+// TODO: upper case1
+#ifdef PERFECT_CHANNEL_NO_QUEUES
+struct frame {
+    // TODO: not needed for UDP version!
+	// 2312 MTU 802.11 + sizeof(struct frame) = 2 bytes = max value: 65536
+    uint16_t frame_len;
+    u64 cookie;
+    uint32_t flags;
+	uint32_t signal;
+    int tx_rates_count;
+	// assume there are at most 256 senders!
+	uint8_t sender;
+    struct hwsim_tx_rate tx_rates[IEEE80211_TX_MAX_RATES];
+    size_t data_len;
+    u8 data[0];			/* frame contents */
+};
+#else
 struct frame {
 	struct list_head list;		/* frame queue list */
 	struct timespec expires;	/* frame delivery (absolute) */
@@ -110,6 +131,7 @@ struct frame {
 	size_t data_len;
 	u8 data[0];			/* frame contents */
 };
+#endif
 
 void station_init_queues(struct station *station);
 double get_error_prob(double snr, unsigned int rate_idx, int frame_len);

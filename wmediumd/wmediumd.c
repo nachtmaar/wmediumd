@@ -45,17 +45,13 @@
 #include <sys/socket.h>
 #include <assert.h>
 #include <pthread.h>
+#include <netdb.h>
 
 #include "message.h"
 
-// TODO:
-#define PDU 1400
+#define BUF_SIZE 65536
 
-#define BUF_SIZE 65507
-static struct wmediumd *wmediumd;
-
-
-#define PERFECT_CHANNEL
+#define MTU_80211 2312
 
 // otherwise use TCP!
 #define SOCK_OPT_MCAST
@@ -63,84 +59,175 @@ static struct wmediumd *wmediumd;
 
 #define MODE_DISTRIBUTED
 
-bool is_multicast_ether_addr(const u8 *addr)
+/* valgrind performance study PERFECT_CHANNEL_NO_QUEUES:
+    424,411,339  /build/glibc-GKVZIf/glibc-2.23/stdio-common/vfscanf.c:_IO_vfscanf [/lib/x86_64-linux-gnu/libc-2.23.so]
+    227,856,759  /build/glibc-GKVZIf/glibc-2.23/stdio-common/vfprintf.c:vfprintf [/lib/x86_64-linux-gnu/libc-2.23.so]
+    172,096,216  /build/glibc-GKVZIf/glibc-2.23/libio/fileops.c:_IO_file_xsputn@@GLIBC_2.2.5 [/lib/x86_64-linux-gnu/libc-2.23.so]
+    169,167,248  /build/glibc-GKVZIf/glibc-2.23/stdlib/../stdlib/strtol_l.c:____strtoul_l_internal [/lib/x86_64-linux-gnu/libc-2.23.so]
+    130,125,990  /build/glibc-GKVZIf/glibc-2.23/malloc/malloc.c:_int_malloc [/lib/x86_64-linux-gnu/libc-2.23.so]
+    126,249,859  /build/glibc-GKVZIf/glibc-2.23/string/../sysdeps/x86_64/multiarch/../memset.S:__GI_memset [/lib/x86_64-linux-gnu/libc-2.23.so]
+*/
+// variadric macro -> valgrind
+//#define DEBUG
+
+#ifdef DEBUG
+    #define MY_PRINTF(f_, ...) printf((f_), ##__VA_ARGS__)
+#else
+    #define MY_PRINTF(f_, ...)
+#endif
+
+static struct wmediumd *wmediumd;
+uint8_t local_mac_addr[6];
+
+//////////////////////////////////////////////////////////////////////////////
+// Memory allocation
+//////////////////////////////////////////////////////////////////////////////
+
+static inline void* mymalloc_random(size_t size) {
+    void *ptr = malloc(size);
+    if(!ptr) {
+        perror("Could not malloc memory: \n");
+        exit(1);
+    }
+    return ptr;
+}
+
+static inline void* mymalloc_zero(size_t size) {
+    void *ptr = calloc(1, size);
+    if(!ptr) {
+        perror("Could not malloc memory: \n");
+        exit(1);
+    }
+    return ptr;
+}
+
+static inline void* mycalloc(size_t count, size_t size) {
+    void *ptr = calloc(count, size);
+    if(!ptr) {
+        perror("Could not malloc memory: \n");
+        exit(1);
+    }
+    return ptr;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Socket checking
+//////////////////////////////////////////////////////////////////////////////
+
+static inline void check_recv_call(int retcode) {
+    if(retcode < 0) {
+        // TODO: how to use perror here?
+        fprintf(stderr, "socket recv error!\n");
+        exit(1);
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// MAC stuff
+//////////////////////////////////////////////////////////////////////////////
+
+static inline bool is_multicast_ether_addr(const u8 *addr)
 {
+//	MY_PRINTF("is_multicast_ether_addr: %d\n", 0x01 & addr[0]);
 	return 0x01 & addr[0];
 }
 
+
+void remember_local_mac() {
+
+    FILE *fd;
+
+    unsigned int values[6];
+
+    char *path_to_mac_addr = "/sys/class/net/wlan0/address";
+    fd = fopen(path_to_mac_addr, "r");
+    if (fd == NULL) {
+        fprintf(stderr, "Could not open '%s'\n", path_to_mac_addr);
+        exit(1);
+    }
+
+    fscanf(fd, "%X:%X:%X:%X:%X:%X", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]);
+    /* convert to uint8_t */
+    for( int i = 0; i < 6; ++i ) {
+        local_mac_addr[i] = (uint8_t) values[i];
+    }
+
+    fclose(fd);
+}
+
 // TODO: make more generic
-bool is_local_mac(uint8_t *mac) {
+static inline bool is_local_mac(uint8_t *mac) {
 
-	FILE *fd;
-
-	uint8_t mac_addr[6];
-	unsigned int values[6];
-
-	char *path_to_mac_addr = "/sys/class/net/wlan0/address";
-	fd = fopen(path_to_mac_addr, "r");
-	if (fd == NULL) {
-		fprintf(stderr, "Could not open '%s'\n", path_to_mac_addr);
-		exit(1);
-	}
-
-	fscanf(fd, "%X:%X:%X:%X:%X:%X", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]);
-	/* convert to uint8_t */
-	for( int i = 0; i < 6; ++i ) {
-		mac_addr[i] = (uint8_t) values[i];
-	}
-
-	fclose(fd);
-	return memcmp(mac, mac_addr, 6) == 0;
+	return memcmp(mac, local_mac_addr, 6) == 0;
 }
 
 //////////////////////////////////////////////////////////////////////////////
 // Network receiving methods
 //////////////////////////////////////////////////////////////////////////////
-
 /**
- * Receive a `struct frame_copy` from the socket.
+ * Receive a `struct frame` from the socket.
+ * NOTE: the caller is responsible for freeing up the space!
  */
-char* recv_frames(int socket, char *buffer, ssize_t buf_size) {
+
+#ifdef SOCK_OPT_MCAST
+static inline struct frame** recv_frame(int socket) {
 	ssize_t len;
 
-	len = recv(socket, buffer, buf_size, 0);
+	char buffer[BUF_SIZE];
+	len = recv(socket, buffer, BUF_SIZE, 0);
 	if(0 >= len) {
-		fprintf(stderr, "socket EOF!\n");
+		perror("socket recv error: \n");
 		exit(1);
 	}
-	printf("Received frame length: %ld\n", len);
+	MY_PRINTF("Received frame with length: %ld\n", len);
 
-	return buffer;
+	// we can safely allocate memory with random bytes because after memcpy they could be random again!
+	struct frame *frame = mymalloc_random(len);
+	memcpy(frame, buffer, len);
+
+	return frame;
 }
+#else
+struct frame** recv_frame(int socket) {
 
-///**
-// * Receive a `struct frame_copy` from the socket.
-// */
-//struct frame_copy** recv_frame_copy(int socket, char *buffer, ssize_t buf_size) {
-//	ssize_t len;
-//
-//	len = recv(socket, buffer, buf_size, 0);
-//	if(0 >= len) {
-//		fprintf(stderr, "socket EOF!\n");
-//		exit(1);
-//	}
-//	printf("Received frame length: %ld\n", len);
-//
-//	// get struct from buffer
-//	// TODO: check every malloc call for failure ...
-//	struct frame_copy *frame_copy = malloc(len);
-//	memcpy(frame_copy, buffer, len);
-//	printf("received frame ...\n");
-//
-//	return frame_copy;
-//}
+	ssize_t len = 0;
+	ssize_t ret_code;
+
+//	// TODO: add check for every recv call
+//	unsigned char node_id;
+//	ret_code = recv(socket, &node_id, sizeof(char), 0);
+//	check_recv_call(ret_code == sizeof(char));
+//	len += ret_code;
+
+	uint16_t frame_size;
+	ret_code = recv(socket, &frame_size, sizeof(frame_size), MSG_WAITALL);
+   	check_recv_call(ret_code == sizeof(frame_size) && ret_code > 0);
+	len += ret_code;
+	MY_PRINTF("len: %d\n", len);
+	MY_PRINTF(">>> frame size: %d\n", frame_size);
+
+	char *buffer = mymalloc_random(frame_size);
+	memcpy(buffer, &frame_size, sizeof(frame_size));
+
+	// recv rest of frame
+	size_t rest_of_frame_size = frame_size - sizeof(frame_size);
+	ret_code = recv(socket, buffer + sizeof(frame_size), rest_of_frame_size, MSG_WAITALL);
+	check_recv_call(ret_code == (ssize_t)rest_of_frame_size && ret_code > 0);
+	len += ret_code;
+	MY_PRINTF("Received frame with length: %ld\n", len);
+
+
+
+	return (struct frame*)buffer;
+}
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 // Socket creation/connection/binding/teardown
 //////////////////////////////////////////////////////////////////////////////
 
 int connect_frame_distribution_socket() {
-	printf("connecting socket ...\n");
+	MY_PRINTF("connecting socket ...\n");
 
 	// Socket address, internet style
 	struct sockaddr_in addr;
@@ -176,7 +263,9 @@ int connect_frame_distribution_socket() {
 #ifdef SOCK_OPT_MCAST
 	if(0 > bind(mysocket, (struct sockaddr*) &addr, sizeof(addr))) {
 #else
-		if(0 > connect(mysocket, (struct sockaddr *)&addr, sizeof(struct sockaddr))) {
+	inet_aton("172.21.0.3", &addr.sin_addr);
+
+	if(0 > connect(mysocket, (struct sockaddr *)&addr, sizeof(addr))) {
 #endif
 		fprintf(stderr, "Error : Connect Failed \n");
 		return EXIT_FAILURE;
@@ -202,144 +291,109 @@ int disconnect_frame_distribution_socket() {
 	return EXIT_SUCCESS;
 }
 
-//////////////////////////////////////////////////////////////////////////////
-// Frame (de)serialization
-//////////////////////////////////////////////////////////////////////////////
-
-struct station *get_sender_station_by_index(int index) {
+////////////////////////////////////////////////////////////////////////////////
+//// Frame (de)serialization
+////////////////////////////////////////////////////////////////////////////////
+//
+static inline struct station *get_sender_station_by_index(unsigned int index) {
 	struct station *cur_station;
 	list_for_each_entry(cur_station, &wmediumd->stations, list) {
 		if(cur_station->index == index) {
 			return cur_station;
 		}
 	}
+	// TODO: fprintf with format string?
+	printf("Station not found for index: %d\n", index);
+	exit(1);
 
-	//perror("Station not found for index: %d\n", index);
 	return NULL;
 }
 
-/**
- * Serialize frame by copying all pointers content.
- * The station struct is replaced by it's index.
- */
-struct frame_copy* frame_serialize(struct frame *frame) {
-	int total_struct_length = sizeof(struct frame_copy) + frame->data_len;
-	struct frame_copy *frame_copy = malloc(total_struct_length);
+//
+///**
+// * Serialize frame by copying all pointers content.
+// * The station struct is replaced by it's index.
+// * NOTE: caller has the responsibility to free!
+// */
+//struct frame_copy* frame_serialize(struct frame *frame) {
+//	int total_struct_length = sizeof(struct frame_copy) + frame->data_len;
+//	struct frame_copy *frame_copy = mymalloc_zero(total_struct_length);
+//
+//	frame_copy->expires.tv_sec = frame->expires.tv_sec;
+//	frame_copy->expires.tv_nsec = frame->expires.tv_nsec;
+//
+//	frame_copy->acked = frame->acked;
+//	frame_copy->cookie = frame->cookie;
+//	frame_copy->flags = frame->flags;
+//	frame_copy->signal = frame->signal;
+//	frame_copy->tx_rates_count = frame->tx_rates_count;
+//	// copy index of station instead of whole structure
+//	frame_copy->sender = frame->sender->index;
+//
+//	// copy array value by value
+//	for(int i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
+//		frame_copy->tx_rates[i] = frame->tx_rates[i];
+//	}
+//
+//	frame_copy->data_len = frame->data_len;
+//
+//	// copy data array
+//	memcpy(frame_copy->data, frame->data, frame->data_len);
+//
+//	frame_copy->total_struct_length = total_struct_length;
+//
+//	return frame_copy;
+//}
+//
+///**
+// * Deserialize a frame and get the station from the index.
+// */
+//struct frame* frame_deserialization(struct frame_copy *frame_copy) {
+//	struct frame *frame = mymalloc_zero(sizeof(struct frame) + frame_copy->data_len);
+//
+//	frame->expires.tv_sec = frame_copy->expires.tv_sec;
+//	frame->expires.tv_nsec = frame_copy->expires.tv_nsec;
+//
+//	frame->acked = frame_copy->acked;
+//	frame->cookie = frame_copy->cookie;
+//	frame->flags = frame_copy->flags;
+//	frame->signal = frame_copy->signal;
+//	frame->tx_rates_count = frame_copy->tx_rates_count;
+//	// copy index of station instead of whole structure
+//	frame->sender = get_sender_station_by_index(frame_copy->sender);
+//	if(!frame->sender) {
+//		fprintf(stderr, "frame_deserialization: \n");
+//	}
+//
+//	for(int i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
+//		frame->tx_rates[i] = frame_copy->tx_rates[i];
+//	}
+//
+//	memcpy(frame->data, frame_copy->data, frame_copy->data_len);
+//	frame->data_len = frame_copy->data_len;
+//
+//	return frame;
+//}
 
-	frame_copy->expires.tv_sec = frame->expires.tv_sec;
-	frame_copy->expires.tv_nsec = frame->expires.tv_nsec;
-
-	frame_copy->acked = frame->acked;
-	frame_copy->cookie = frame->cookie;
-	frame_copy->flags = frame->flags;
-	frame_copy->signal = frame->signal;
-	frame_copy->tx_rates_count = frame->tx_rates_count;
-	// copy index of station instead of whole structure
-	frame_copy->sender = frame->sender->index;
-
-	// copy array value by value
-	for(int i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
-		frame_copy->tx_rates[i] = frame->tx_rates[i];
-	}
-
-	frame_copy->data_len = frame->data_len;
-
-	// copy data array
-	memcpy(frame_copy->data, frame->data, frame->data_len);
-
-	frame_copy->total_struct_length = total_struct_length;
-
-	return frame_copy;
-}
-
-/**
- * Deserialize a frame and get the station from the index.
- */
-struct frame* frame_deserialization(struct frame_copy *frame_copy) {
-	struct frame *frame = malloc(sizeof(struct frame) + frame_copy->data_len);
-
-	frame->expires.tv_sec = frame_copy->expires.tv_sec;
-	frame->expires.tv_nsec = frame_copy->expires.tv_nsec;
-
-	frame->acked = frame_copy->acked;
-	frame->cookie = frame_copy->cookie;
-	frame->flags = frame_copy->flags;
-	frame->signal = frame_copy->signal;
-	frame->tx_rates_count = frame_copy->tx_rates_count;
-	// copy index of station instead of whole structure
-	frame->sender = get_sender_station_by_index(frame_copy->sender);
-	if(!frame->sender) {
-		fprintf(stderr, "frame_deserialization: \n");
-	}
-
-	for(int i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
-		frame->tx_rates[i] = frame_copy->tx_rates[i];
-	}
-
-	memcpy(frame->data, frame_copy->data, frame_copy->data_len);
-	frame->data_len = frame_copy->data_len;
-
-	return frame;
-}
-
-static char buffer[PDU];
-static int buf_size = 0;
-
-typedef unsigned char buffer_len;
-
-#define END_OF_BUFFER 0
-
-/**
- * Fill the buffer and return the new buffer size. -1 if buffer full.
- *
- */
-ssize_t fill_buffer(char *data, buffer_len byte_len) {
-
-	// append END_OF_BUFFER
-	if(buf_size + byte_len + 1 >= PDU) {
-		//buffer[buf_size] = END_OF_BUFFER;
-		// include at least one END_OF_BUFFER
-		buf_size += 1;
-		return 	-1;
-	}
-	else {
-
-		// include length of following data
-		buffer[buf_size] = byte_len;
-		buf_size += 1;
-
-		// append data to buffer
-		memcpy(buffer + buf_size, data, byte_len);
-		buf_size += byte_len;
-
-		fprintf(stderr, "buffer_fill: %d\n", buf_size);
-		return buf_size;
-	}
-}
-
-void clear_buffer() {
-	buf_size = 0;
-	// clear buffer
-	memset(buffer, END_OF_BUFFER, PDU);
-}
-
-bool is_multicast_frame(struct frame_copy *frame_copy) {
-	struct ieee80211_hdr *hdr = (void *) frame_copy->data;
+static inline bool is_multicast_frame(struct frame *frame) {
+	struct ieee80211_hdr *hdr = (void *) frame->data;
 	u8 *dest = hdr->addr1;
 	return is_multicast_ether_addr(dest);
 }
 
 // TODO: convert to big-endian!
 /**
- * Send a `frame_copy` via the network
+ * Send a `frame` via the network
  */
-int send_frame(struct frame_copy *frame_copy)
+
+static inline int send_frame(struct frame *frame)
 {
+	uint16_t frame_len = frame->frame_len;
 
 #ifdef SOCK_OPT_MCAST
 
 	struct sockaddr_in addr;
-	ssize_t bytes_to_send = frame_copy->total_struct_length;
+
 	// configure addr struct
 	// zero struct
 	// TODO: reuse addr struct! refactoring!
@@ -348,63 +402,32 @@ int send_frame(struct frame_copy *frame_copy)
 	addr.sin_addr.s_addr = inet_addr(MCAST_GROUP);
 	addr.sin_port = htons(PORTNUM);
 
-	// beacon frames
-	if (is_multicast_frame(frame_copy)) {
-		printf("sending baecon (%d) via mcast ...\n", frame_copy->total_struct_length);
-
-		int frame_size = frame_copy->total_struct_length + 1;
-		char buffer[frame_size];
-		buffer[0] = frame_copy->total_struct_length;
-		memcpy(buffer+1, frame_copy, frame_copy->total_struct_length);
-
-		if (0 >= sendto(mysocket, buffer, frame_size, 0, (struct sockaddr *) &addr, sizeof(addr))) {
-			perror("Error : Send Failed");
-			return EXIT_FAILURE;
-		}
-		else {
-			printf("Sent ieee80211 frame ...\n");
-		}
-		// TODO:
-		//free(frame_copy_with_length);
-	}
-	else {
-		// send the full buffer and clear it afterwards
-		if (-1 == fill_buffer((char *) frame_copy, (buffer_len) bytes_to_send)) {
-
-			// send actual payload
-			printf("sending local frame (%d) via mcast ...\n", buf_size);
-			if (0 >= sendto(mysocket, buffer, buf_size, 0, (struct sockaddr *) &addr, sizeof(addr))) {
-				perror("Error : Send Failed");
-				return EXIT_FAILURE;
-			}
-			else {
-				printf("Sent ieee80211 frame ...\n");
-			}
-			clear_buffer();
-
-		}
-			// add data to empty buffer
-		else {
-			fill_buffer((char *) frame_copy, bytes_to_send);
-		}
-	}
-#else
 
 	// send actual payload
-	if(0 >= send(mysocket, frame_copy, frame_copy->total_struct_length, 0)) {
-		perror("Error : Send Failed");
+	if(0 >= sendto(mysocket, frame, frame_len, 0, (struct sockaddr*) &addr, sizeof(addr)))  {
+		fprintf(stderr, "Error : Send Failed \n");
 		return EXIT_FAILURE;
 	}
 	else {
-		printf("Sent ieee80211 frame ...\n");
+		MY_PRINTF("Sent ieee80211 frame ...\n");
+	}
+
+#else
+
+	// send actual payload
+	if(0 >= send(mysocket, frame, frame_len, 0)) {
+		MY_PRINTF("Error : Send Failed \n");
+		return EXIT_FAILURE;
+	}
+	else {
+		MY_PRINTF("Sent ieee80211 frame ...\n");
 	}
 #endif
 
 	return EXIT_SUCCESS;
 }
 
-
-# define index_to_rate_size 8
+#define index_to_rate_size 8
 static int index_to_rate[] = {
 	60, 90, 120, 180, 240, 360, 480, 540
 };
@@ -459,6 +482,7 @@ void timespec_add_usec(struct timespec *t, int usec)
 	}
 }
 
+#ifndef PERFECT_CHANNEL
 void rearm_timer()
 {
 	struct timespec min_expires;
@@ -492,6 +516,7 @@ void rearm_timer()
 	// arm timer at expires->it_value
 	timerfd_settime(wmediumd->timerfd, TFD_TIMER_ABSTIME, &expires, NULL);
 }
+#endif
 
 static inline bool frame_has_a4(struct frame *frame)
 {
@@ -550,6 +575,7 @@ static enum ieee80211_ac_number frame_select_queue_80211(struct frame *frame)
 	return ieee802_1d_to_ac[priority];
 }
 
+
 static struct station *get_station_by_addr(u8 *addr)
 {
 	struct station *station;
@@ -569,7 +595,7 @@ static int get_link_snr(struct station *sender,
 
 void queue_frame(struct frame *frame)
 {
-	struct station *station = frame->sender;
+	struct station *station = get_sender_station_by_index(frame->sender);
 
 	struct ieee80211_hdr *hdr = (void *)frame->data;
 	u8 *dest = hdr->addr1;
@@ -577,25 +603,14 @@ void queue_frame(struct frame *frame)
 	struct wqueue *queue;
 	struct frame *tail;
 	struct station *tmpsta;
-	int send_time;
+
 	int cw;
-	double error_prob;
-	bool is_acked = false;
-	bool noack = false;
-	int i, j;
-	int rate_idx;
+	int i;
 	int ac;
 
 	/* TODO configure phy parameters */
-	int slot_time = 9;
-	int sifs = 16;
-	int difs = 2 * slot_time + sifs;
-
-	int retries = 0;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
-
-	int ack_time_usec = pkt_duration(14, index_to_rate[0]) + sifs;
 
 	/*
 	 * To determine a frame's expiration time, we compute the
@@ -610,7 +625,6 @@ void queue_frame(struct frame *frame)
 	queue = &station->queues[ac];
 
 	/* try to "send" this frame at each of the rates in the rateset */
-	send_time = 0;
 	cw = queue->cw_min;
 
 	int snr = SNR_DEFAULT;
@@ -623,10 +637,31 @@ void queue_frame(struct frame *frame)
 		}
 		else {
 			fprintf(stderr, "Station not found!\n");
+			exit(1);
 		}
 	}
 
 	frame->signal = snr;
+
+#ifndef PERFECT_CHANNEL
+    int j;
+
+	double error_prob;
+
+	int sifs = 16;
+	int slot_time = 9;
+	int difs = 2 * slot_time + sifs;
+
+	bool is_acked = false;
+	bool noack = false;
+	int rate_idx;
+
+	int retries = 0;
+
+	int send_time;
+
+
+	int ack_time_usec = pkt_duration(14, index_to_rate[0]) + sifs;
 
 	noack = frame_is_mgmt(frame) || is_multicast_ether_addr(dest);
 	double choice = -3.14;
@@ -685,6 +720,7 @@ void queue_frame(struct frame *frame)
 		}
 		frame->flags |= HWSIM_TX_STAT_ACK;
 	}
+	timespec_add_usec(&target, send_time);
 
 	/*
 	 * delivery time starts after any equal or higher prio frame
@@ -700,61 +736,62 @@ void queue_frame(struct frame *frame)
 		}
 	}
 
-	timespec_add_usec(&target, send_time);
 
 	frame->expires = target;
+	// queue frames into qos queue
 	list_add_tail(&frame->list, &queue->frames);
 	rearm_timer(wmediumd);
+#else
+	frame->flags |= HWSIM_TX_STAT_ACK;
+#endif
+
 }
+
 
 /*
  * Report transmit status to the kernel.
  */
 int send_tx_info_frame_nl(struct station *src,
-			  unsigned int flags, int signal,
+			  unsigned int flags, uint32_t signal,
 			  struct hwsim_tx_rate *tx_attempts,
 			  u64 cookie)
 {
 
-	if(is_local_mac(src->hwaddr)) {
-		struct nl_sock *sock = wmediumd->sock;
-		struct nl_msg *msg;
+	struct nl_sock *sock = wmediumd->sock;
+	struct nl_msg *msg;
 
-		msg = nlmsg_alloc();
-		if (!msg) {
-			printf("Error allocating new message MSG!\n");
-			goto out;
-		}
-
-		genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(wmediumd->family),
-					0, NLM_F_REQUEST, HWSIM_CMD_TX_INFO_FRAME, VERSION_NR);
-
-		int rc;
-
-		rc = nla_put(msg, HWSIM_ATTR_ADDR_TRANSMITTER, ETH_ALEN, src->hwaddr);
-		rc = nla_put_u32(msg, HWSIM_ATTR_FLAGS, flags);
-		rc = nla_put_u32(msg, HWSIM_ATTR_SIGNAL, signal);
-		rc = nla_put(msg, HWSIM_ATTR_TX_INFO,
-					 IEEE80211_TX_MAX_RATES * sizeof(struct hwsim_tx_rate),
-					 tx_attempts);
-
-		rc = nla_put_u64(msg, HWSIM_ATTR_COOKIE, cookie);
-
-		if (rc != 0) {
-			printf("Error filling payload\n");
-			goto out;
-		}
-
-		nl_send_auto_complete(sock, msg);
-		nlmsg_free(msg);
-		return 0;
-		out:
-		nlmsg_free(msg);
-		return -1;
+	msg = nlmsg_alloc();
+	if (!msg) {
+		MY_PRINTF("Error allocating new message MSG!\n");
+		goto out;
 	}
-	else {
-		printf("No local tx info!\n");
+
+	genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, genl_family_get_id(wmediumd->family),
+				0, NLM_F_REQUEST, HWSIM_CMD_TX_INFO_FRAME, VERSION_NR);
+
+	int rc;
+
+	rc = nla_put(msg, HWSIM_ATTR_ADDR_TRANSMITTER, ETH_ALEN, src->hwaddr);
+	rc = nla_put_u32(msg, HWSIM_ATTR_FLAGS, flags);
+	rc = nla_put_u32(msg, HWSIM_ATTR_SIGNAL, signal);
+	rc = nla_put(msg, HWSIM_ATTR_TX_INFO,
+				 IEEE80211_TX_MAX_RATES * sizeof(struct hwsim_tx_rate),
+				 tx_attempts);
+
+	rc = nla_put_u64(msg, HWSIM_ATTR_COOKIE, cookie);
+
+	if (rc != 0) {
+		MY_PRINTF("Error filling payload\n");
+		goto out;
 	}
+
+	nl_send_auto_complete(sock, msg);
+	nlmsg_free(msg);
+	return 0;
+	out:
+	nlmsg_free(msg);
+	return -1;
+
 	return 0;
 }
 
@@ -762,14 +799,14 @@ int send_tx_info_frame_nl(struct station *src,
  * Send a data frame to the kernel for reception at a specific radio.
  */
 int send_cloned_frame_msg(struct station *dst,
-			  u8 *data, int data_len, int signal)
+			  u8 *data, int data_len, uint32_t signal)
 {
 	struct nl_msg *msg;
 	struct nl_sock *sock = wmediumd->sock;
 
 	msg = nlmsg_alloc();
 	if (!msg) {
-		printf("Error allocating new message MSG!\n");
+		MY_PRINTF("Error allocating new message MSG!\n");
 		goto out;
 	}
 
@@ -784,10 +821,10 @@ int send_cloned_frame_msg(struct station *dst,
 	rc = nla_put_u32(msg, HWSIM_ATTR_SIGNAL, -50);
 
 	if (rc != 0) {
-		printf("Error filling payload\n");
+		MY_PRINTF("Error filling payload\n");
 		goto out;
 	}
-	printf("cloned msg dest " MAC_FMT " (radio: " MAC_FMT ") len %d\n",
+	MY_PRINTF("cloned msg dest " MAC_FMT " (radio: " MAC_FMT ") len %d\n",
 	       MAC_ARGS(dst->addr), MAC_ARGS(dst->hwaddr), data_len);
 
 	nl_send_auto(sock, msg);
@@ -803,12 +840,12 @@ void deliver_frame(struct frame *frame)
 	struct ieee80211_hdr *hdr = (void *) frame->data;
 	struct station *station;
 	u8 *dest = hdr->addr1;
-	u8 *src = frame->sender->addr;
+	struct station *sender = get_sender_station_by_index(frame->sender);
+	u8 *src = sender->addr;
 
 	if (frame->flags & HWSIM_TX_STAT_ACK) {
 		// for each station copy the frame
 		/* rx the frame on the dest interface */
-		// TODO: we have only one interface in the distributed mode! therefore we can save performance here!
 		list_for_each_entry(station, &wmediumd->stations, list) {
 
 			// we have only one local station!
@@ -820,33 +857,36 @@ void deliver_frame(struct frame *frame)
 			if (memcmp(src, station->addr, ETH_ALEN) == 0)
 				continue;
 
-			// necessary to prevent netlink errors
-			if(!is_local_mac(station->addr))
-				break;
-
 			// beacon frames
 			if (is_multicast_ether_addr(dest)) {
-				int signal, rate_idx;
-				double error_prob;
+				uint32_t signal;
+				int rate_idx;
 
+				double error_prob;
 				/*
 				 * we may or may not receive this based on
 				 * reverse link from sender -- check for
 				 * each receiver.
 				 */
-				signal = get_link_snr(station, frame->sender);
+#ifdef PERFECT_CHANNEL
+				signal = SNR_DEFAULT;
+#else
+				signal = get_link_snr(station, sender);
+#endif
 				// TODO:
+#ifndef PERFECT_CHANNEL
 				rate_idx = index_to_rate[index_to_rate_size];
 				error_prob = get_error_prob((double)signal,
 							    rate_idx, frame->data_len);
 
+
 				if (drand48() <= error_prob) {
-					printf("Dropped mcast from "
+					MY_PRINTF("Dropped mcast from "
 					       MAC_FMT " to " MAC_FMT " at receiver\n",
 					       MAC_ARGS(src), MAC_ARGS(station->addr));
 					continue;
 				}
-
+#endif
 				send_cloned_frame_msg(station,
 						      frame->data,
 						      frame->data_len,
@@ -864,19 +904,18 @@ void deliver_frame(struct frame *frame)
 			}
 		}
 	}
-	send_tx_info_frame_nl(frame->sender, frame->flags,
-						  frame->signal, frame->tx_rates, frame->cookie);
 
 	// necessary to prevent netlink errors (code 3)
 	if(is_local_mac(src)) {
 
-		send_tx_info_frame_nl(frame->sender, frame->flags,
+		send_tx_info_frame_nl(sender, frame->flags,
 							  frame->signal, frame->tx_rates, frame->cookie);
 	}
 
-	free(frame);
+	//free(frame);
 }
 
+#ifndef PERFECT_CHANNEL
 void deliver_expired_frames_queue(struct list_head *queue,
 				  struct timespec *now)
 {
@@ -905,29 +944,26 @@ void deliver_expired_frames(struct wmediumd *ctx)
 	list_for_each_entry(station, &ctx->stations, list) {
 
 		// TODO: needs to be copied to each station!
-//		if(is_local_mac(station->hwaddr)) {
-			int q_ct[IEEE80211_NUM_ACS] = {};
-			// iterate over wlan queues
-			for (i = 0; i < IEEE80211_NUM_ACS; i++) {
-				list_for_each(l, &station->queues[i].frames) {
-					q_ct[i]++;
-				}
+#ifndef PERFECT_CHANNEL
+		int q_ct[IEEE80211_NUM_ACS] = {};
+		// iterate over wlan queues
+		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+			list_for_each(l, &station->queues[i].frames) {
+				q_ct[i]++;
 			}
-			printf("[" TIME_FMT "] Station " MAC_FMT
-						   " BK %d BE %d VI %d VO %d\n",
-				   TIME_ARGS(&now), MAC_ARGS(station->addr),
-				   q_ct[IEEE80211_AC_BK], q_ct[IEEE80211_AC_BE],
-				   q_ct[IEEE80211_AC_VI], q_ct[IEEE80211_AC_VO]);
+		}
+		MY_PRINTF("[" TIME_FMT "] Station " MAC_FMT
+					   " BK %d BE %d VI %d VO %d\n",
+			   TIME_ARGS(&now), MAC_ARGS(station->addr),
+			   q_ct[IEEE80211_AC_BK], q_ct[IEEE80211_AC_BE],
+			   q_ct[IEEE80211_AC_VI], q_ct[IEEE80211_AC_VO]);
+#endif
+		for (i = 0; i < IEEE80211_NUM_ACS; i++)
+			deliver_expired_frames_queue(&station->queues[i].frames, &now);
 
-			for (i = 0; i < IEEE80211_NUM_ACS; i++)
-				deliver_expired_frames_queue(&station->queues[i].frames, &now);
-//		}
-//		else {
-//			printf("skipping deliver_expired_frames for non-local station ...\n");
-//		}
 	}
-	printf("\n\n");
 }
+#endif
 
 static
 int nl_err_cb(struct sockaddr_nl *nla, struct nlmsgerr *nlerr, void *arg)
@@ -946,52 +982,31 @@ int nl_err_cb(struct sockaddr_nl *nla, struct nlmsgerr *nlerr, void *arg)
 /**
  * Receives new frames and delivers them to the kernel via `queue_frame`.
  */
-static void process_incoming_frames() {
 
+static void process_incoming_frames() {
 	while(1) {
 
-		printf("process_incoming_frames ...\n");
+		MY_PRINTF("process_incoming_frames ...\n");
 
-		char buffer[PDU];
-		// receive frame(s)
-		recv_frames(mysocket, buffer, PDU);
+		// receive frame
+		struct frame *frame = recv_frame(mysocket);
 
-		// pointer in stream
-		ssize_t offset = 0;
+		//struct frame *detransformed_frame;
 
-		// demultiplex frame(s)
-		while(1) {
-			buffer_len len = buffer[offset];
+		// deserialize it
+		//detransformed_frame = frame_deserialization(frame);
 
-			if((char)len == END_OF_BUFFER) {
-				break;
-			}
+#ifdef PERFECT_CHANNEL_NO_QUEUES
+		deliver_frame(frame);
+#else
+		// queue frame
+		queue_frame(frame);
+#endif
 
-			offset += 1;
-
-			struct frame_copy *frame_copy = malloc(len);
-			// copy frame from buffer
-			memcpy(frame_copy, buffer + offset, len);
-
-			offset += len;
-
-			struct frame *detransformed_frame;
-
-			// TODO: free
-			// deserialize it
-			detransformed_frame = frame_deserialization(frame_copy);
-
-			// queue frame
-			queue_frame(detransformed_frame);
-
-			free(frame_copy);
-
-			// received baecon -> enter while loop again
-			if(is_multicast_frame(frame_copy)) {
-				printf("received baecon ...\n");
-				break;
-			}
-		}
+		free(frame);
+//#ifdef PERFECT_CHANNEL_NO_QUEUES
+//		free(detransformed_frame);
+//#endif
 
 	}
 }
@@ -1027,7 +1042,7 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			unsigned int data_len =
 				nla_len(attrs[HWSIM_ATTR_FRAME]);
 			char *data = (char *)nla_data(attrs[HWSIM_ATTR_FRAME]);
-			unsigned int flags =
+			uint32_t flags =
 				nla_get_u32(attrs[HWSIM_ATTR_FLAGS]);
 			unsigned int tx_rates_len =
 				nla_len(attrs[HWSIM_ATTR_TX_INFO]);
@@ -1052,7 +1067,8 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			}
 			memcpy(sender->hwaddr, hwaddr, ETH_ALEN);
 
-			frame = malloc(sizeof(*frame) + data_len);
+			frame = mymalloc_zero(sizeof(*frame) + data_len);
+
 			if (!frame)
 				goto out;
 
@@ -1061,24 +1077,39 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 			frame->data_len = data_len;
 			frame->flags = flags;
 			frame->cookie = cookie;
-			frame->sender = sender;
+			frame->sender = sender->index;
 			frame->tx_rates_count =
 				tx_rates_len / sizeof(struct hwsim_tx_rate);
 			memcpy(frame->tx_rates, tx_rates,
 			       min(tx_rates_len, sizeof(frame->tx_rates)));
 
+			frame->frame_len = sizeof(struct frame) + frame->data_len;
+#ifdef PERFECT_CHANNEL_NO_QUEUES
+			frame->flags |= HWSIM_TX_STAT_ACK;
+			deliver_frame(frame);
+#else
+            // TODO: free frame
 			queue_frame(frame);
+#endif
 
-			struct frame_copy *transformed_frame;
-			// TODO: do not send local frames?
-			// send frame via network, but ignore received frames from others
-			transformed_frame = frame_serialize(frame);
-			printf("sending local frame via mcast ...\n");
-			if (0 > send_frame(transformed_frame)) {
+//			struct frame_copy *transformed_frame;
+//			// TODO: do not send local frames?
+//			// send frame via network, but ignore received frames from others
+//			transformed_frame = frame_serialize(frame);
+//
+			MY_PRINTF("sending frame ...\n");
+			if (0 > send_frame(frame)) {
 				// TODO: replace perror calls?
 				perror("Could not send frame!\n");
 				exit(1);
 			}
+//			free(transformed_frame);
+
+#ifdef PERFECT_CHANNEL_NO_QUEUES
+			free(frame);
+			// TODO: free for else case!
+#endif
+//			MY_PRINTF("sending frame [done]\n");
 		}
 
 	}
@@ -1166,6 +1197,7 @@ void print_help(int exval)
 	exit(exval);
 }
 
+#ifndef PERFECT_CHANNEL
 static void timer_cb(int fd, short what, void *data)
 {
 	struct wmediumd *ctx = data;
@@ -1173,6 +1205,7 @@ static void timer_cb(int fd, short what, void *data)
 	deliver_expired_frames(ctx);
 	rearm_timer(ctx);
 }
+#endif
 
 
 int main(int argc, char *argv[])
@@ -1234,6 +1267,8 @@ int main(int argc, char *argv[])
 	/* init libevent */
 	event_init();
 
+    // valgrind profiling showed that is_local_mac() is very expensive when calculation the wifi0 mac addr every time
+    remember_local_mac();
 	if(connect_frame_distribution_socket() == EXIT_FAILURE) {
 		fprintf(stderr, "Could not open frame distribution channel!\n");
 		return EXIT_FAILURE;
@@ -1245,10 +1280,12 @@ int main(int argc, char *argv[])
 		  sock_event_cb, &ctx);
 	event_add(&ev_cmd, NULL);
 
+#ifndef PERFECT_CHANNEL
 	/* setup timers */
 	ctx.timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
 	event_set(&ev_timer, ctx.timerfd, EV_READ | EV_PERSIST, timer_cb, &ctx);
 	event_add(&ev_timer, NULL);
+#endif
 
 	// process incoming frames
 	// TODO: libevent
@@ -1266,7 +1303,7 @@ int main(int argc, char *argv[])
 
 	/* register for new frames */
 	if (send_register_msg() == 0)
-		printf("REGISTER SENT!\n");
+		MY_PRINTF("REGISTER SENT!\n");
 
 	/* enter libevent main loop */
 	event_dispatch();

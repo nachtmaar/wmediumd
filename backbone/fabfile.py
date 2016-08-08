@@ -9,13 +9,15 @@ def deploy_code(start_cmd=None, deploy_cmd=None, start_debug=False, quiet=False,
     PATH_WMEDIUMD="/root/wmediumd/"
     PATH_WMEDIUMD_SOURCE=os.path.join(PATH_WMEDIUMD, "wmediumd/")
 
+    os.chdir("../")
+
     if deploy_cmd is not None:
         with cd(PATH_WMEDIUMD_SOURCE):
             run(deploy_cmd)
     else:
         rsync_project(
             # local_dir="/Users/nils/Dropbox/uni/masterarbeit/wmediumd",
-            local_dir=os.getcwd(),
+            local_dir=os.path.join(os.getcwd()),
             remote_dir="/root/",
             exclude=["*.pyc", "*.o"],
             delete=True
