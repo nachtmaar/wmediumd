@@ -54,15 +54,11 @@
 
 #define BUF_SIZE 65536
 
-#define MTU_80211 2312
-
 // otherwise use TCP!
 #define SOCK_OPT_MCAST
 #define MCAST_GROUP "239.0.0.1"
-#define PERFECT_CHANNEL
 
 //#define TCP_SMALL_WRITE
-//#define USE_THREAD_POOL
 
 /* valgrind performance study PERFECT_CHANNEL_NO_QUEUES:
     424,411,339  /build/glibc-GKVZIf/glibc-2.23/stdio-common/vfscanf.c:_IO_vfscanf [/lib/x86_64-linux-gnu/libc-2.23.so]
@@ -136,7 +132,6 @@ static inline bool is_multicast_ether_addr(const u8 *addr)
 //	MY_PRINTF("is_multicast_ether_addr: %d\n", 0x01 & addr[0]);
 	return 0x01 & addr[0];
 }
-
 
 void remember_local_mac() {
 
@@ -282,7 +277,7 @@ int connect_frame_distribution_socket() {
 #ifdef SOCK_OPT_MCAST
 	if(0 > bind(mysocket, (struct sockaddr*) &addr, sizeof(addr))) {
 #else
-# TODO: remove hardcoded IP addresses and use CLI instead
+	// TODO: remove hardcoded IP addresses and use CLI instead
 	unsigned long ip_addr = inet_addr("172.21.0.254");
 	memcpy( (char *)&addr.sin_addr, &ip_addr, sizeof(ip_addr));
 
@@ -453,150 +448,6 @@ static int index_to_rate[] = {
 	60, 90, 120, 180, 240, 360, 480, 540
 };
 
-static inline int div_round(int a, int b)
-{
-	return (a + b - 1) / b;
-}
-
-static inline int pkt_duration(int len, int rate)
-{
-	/* preamble + signal + t_sym * n_sym, rate in 100 kbps */
-	return 16 + 4 + 4 * div_round((16 + 8 * len + 6) * 10, 4 * rate);
-}
-
-static void wqueue_init(struct wqueue *wqueue, int cw_min, int cw_max)
-{
-	INIT_LIST_HEAD(&wqueue->frames);
-	wqueue->cw_min = cw_min;
-	wqueue->cw_max = cw_max;
-}
-
-/**
- * http://permalink.gmane.org/gmane.linux.kernel.wireless.general/98501
- * IEEE802.11e (Quality of Service)
- *
- * IEEE80211_AC_BE is best-effort traffic,
- * IEEE80211_AC_BK is background traffic,
- * IEEE80211_AC_VI is video traffic,
- * IEEE80211_AC_VO is voice traffic.
- */
-void station_init_queues(struct station *station)
-{
-	wqueue_init(&station->queues[IEEE80211_AC_BK], 15, 1023);
-	wqueue_init(&station->queues[IEEE80211_AC_BE], 15, 1023);
-	wqueue_init(&station->queues[IEEE80211_AC_VI], 7, 15);
-	wqueue_init(&station->queues[IEEE80211_AC_VO], 3, 7);
-}
-
-bool timespec_before(struct timespec *t1, struct timespec *t2)
-{
-	return t1->tv_sec < t2->tv_sec ||
-	       (t1->tv_sec == t2->tv_sec && t1->tv_nsec < t2->tv_nsec);
-}
-
-void timespec_add_usec(struct timespec *t, int usec)
-{
-	t->tv_nsec += usec * 1000;
-	if (t->tv_nsec >= 1000000000) {
-		t->tv_sec++;
-		t->tv_nsec -= 1000000000;
-	}
-}
-
-#ifndef PERFECT_CHANNEL
-void rearm_timer()
-{
-	struct timespec min_expires;
-	struct itimerspec expires = {};
-	struct station *station;
-	struct frame *frame;
-	int i;
-
-	bool set_min_expires = false;
-
-	/*
-	 * Iterate over all the interfaces to find the next frame that
-	 * will be delivered, and set the timerfd accordingly.
-	 */
-	list_for_each_entry(station, &wmediumd->stations, list) {
-		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
-			frame = list_first_entry_or_null(&station->queues[i].frames,
-							 struct frame, list);
-
-			// find earliest frame expiration time
-			if (frame && (!set_min_expires ||
-					  // frame expires before current min_expires ?
-				      timespec_before(&frame->expires,
-						      &min_expires))) {
-				set_min_expires = true;
-				min_expires = frame->expires;
-			}
-		}
-	}
-	expires.it_value = min_expires;
-	// arm timer at expires->it_value
-	timerfd_settime(wmediumd->timerfd, TFD_TIMER_ABSTIME, &expires, NULL);
-}
-#endif
-
-static inline bool frame_has_a4(struct frame *frame)
-{
-	struct ieee80211_hdr *hdr = (void *)frame->data;
-
-	return (hdr->frame_control[1] & (FCTL_TODS | FCTL_FROMDS)) ==
-		(FCTL_TODS | FCTL_FROMDS);
-}
-
-static inline bool frame_is_mgmt(struct frame *frame)
-{
-	struct ieee80211_hdr *hdr = (void *)frame->data;
-
-	return (hdr->frame_control[0] & FCTL_FTYPE) == FTYPE_MGMT;
-}
-
-static inline bool frame_is_data(struct frame *frame)
-{
-	struct ieee80211_hdr *hdr = (void *)frame->data;
-
-	return (hdr->frame_control[0] & FCTL_FTYPE) == FTYPE_DATA;
-}
-
-static inline bool frame_is_data_qos(struct frame *frame)
-{
-	struct ieee80211_hdr *hdr = (void *)frame->data;
-
-	return (hdr->frame_control[0] & (FCTL_FTYPE | STYPE_QOS_DATA)) ==
-		(FTYPE_DATA | STYPE_QOS_DATA);
-}
-
-static inline u8 *frame_get_qos_ctl(struct frame *frame)
-{
-	struct ieee80211_hdr *hdr = (void *)frame->data;
-
-	if (frame_has_a4(frame))
-		return (u8 *)hdr + 30;
-	else
-		return (u8 *)hdr + 24;
-}
-
-static enum ieee80211_ac_number frame_select_queue_80211(struct frame *frame)
-{
-	u8 *p;
-	int priority;
-
-	if (!frame_is_data(frame))
-		return IEEE80211_AC_VO;
-
-	if (!frame_is_data_qos(frame))
-		return IEEE80211_AC_BE;
-
-	p = frame_get_qos_ctl(frame);
-	priority = *p & QOS_CTL_TAG1D_MASK;
-
-	return ieee802_1d_to_ac[priority];
-}
-
-
 static struct station *get_station_by_addr(u8 *addr)
 {
 	struct station *station;
@@ -607,167 +458,6 @@ static struct station *get_station_by_addr(u8 *addr)
 	}
 	return NULL;
 }
-
-static int get_link_snr(struct station *sender,
-			struct station *receiver)
-{
-	return wmediumd->snr_matrix[sender->index * wmediumd->num_stas + receiver->index];
-}
-
-void queue_frame(struct frame *frame)
-{
-	struct station *station = get_sender_station_by_index(frame->sender);
-
-	struct ieee80211_hdr *hdr = (void *)frame->data;
-	u8 *dest = hdr->addr1;
-	struct timespec now, target;
-	struct wqueue *queue;
-	struct frame *tail;
-	struct station *tmpsta;
-
-	int cw;
-	int i;
-	int ac;
-
-	/* TODO configure phy parameters */
-
-	clock_gettime(CLOCK_MONOTONIC, &now);
-
-	/*
-	 * To determine a frame's expiration time, we compute the
-	 * number of retries we might have to make due to radio conditions
-	 * or contention, and add backoff time accordingly.  To that, we
-	 * add the expiration time of the previous frame in the queue.
-	 */
-
-	// get 80211 qos queue
-	ac = frame_select_queue_80211(frame);
-	// add to station queue
-	queue = &station->queues[ac];
-
-	/* try to "send" this frame at each of the rates in the rateset */
-	cw = queue->cw_min;
-
-	int snr = SNR_DEFAULT;
-
-	if (!is_multicast_ether_addr(dest)) {
-		struct station *deststa;
-		deststa = get_station_by_addr(dest);
-		if (deststa) {
-			snr = get_link_snr(station, deststa);
-		}
-		else {
-			fprintf(stderr, "Station not found!\n");
-			exit(1);
-		}
-	}
-
-	frame->signal = snr;
-
-#ifndef PERFECT_CHANNEL
-    int j;
-
-	double error_prob;
-
-	int sifs = 16;
-	int slot_time = 9;
-	int difs = 2 * slot_time + sifs;
-
-	bool is_acked = false;
-	bool noack = false;
-	int rate_idx;
-
-	int retries = 0;
-
-	int send_time;
-
-
-	int ack_time_usec = pkt_duration(14, index_to_rate[0]) + sifs;
-
-	noack = frame_is_mgmt(frame) || is_multicast_ether_addr(dest);
-	double choice = -3.14;
-
-	for (i = 0; i < IEEE80211_TX_MAX_RATES && !is_acked; i++) {
-
-		rate_idx = frame->tx_rates[i].idx;
-
-		/* no more rates in MRR */
-		if (rate_idx < 0)
-			break;
-
-		error_prob = get_error_prob(snr, rate_idx, frame->data_len);
-		for (j = 0; j < frame->tx_rates[i].count; j++) {
-
-			if(rate_idx > index_to_rate_size -1) {
-
-				fprintf(stderr, "Invalid rate_idx!\n");
-				rate_idx = index_to_rate_size -1;
-			}
-
-			int rate = index_to_rate[rate_idx];
-			send_time += difs + pkt_duration(frame->data_len, rate);
-
-			retries++;
-
-			/* skip ack/backoff/retries for noack frames */
-			if (noack) {
-				is_acked = true;
-				break;
-			}
-
-			/* TODO TXOPs */
-
-			/* backoff */
-			if (j > 0) {
-				send_time += (cw * slot_time) / 2;
-				cw = (cw << 1) + 1;
-				if (cw > queue->cw_max)
-					cw = queue->cw_max;
-			}
-			choice = drand48();
-			if (choice > error_prob) {
-				is_acked = true;
-				break;
-			}
-			send_time += ack_time_usec;
-		}
-	}
-
-	if (is_acked) {
-		frame->tx_rates[i-1].count = j + 1;
-		for (; i < IEEE80211_TX_MAX_RATES; i++) {
-			frame->tx_rates[i].idx = -1;
-			frame->tx_rates[i].count = -1;
-		}
-		frame->flags |= HWSIM_TX_STAT_ACK;
-	}
-	timespec_add_usec(&target, send_time);
-
-	/*
-	 * delivery time starts after any equal or higher prio frame
-	 * (or now, if none).
-	 */
-	target = now;
-	for (i = 0; i <= ac; i++) {
-		list_for_each_entry(tmpsta, &wmediumd->stations, list) {
-			tail = list_last_entry_or_null(&tmpsta->queues[i].frames,
-						       struct frame, list);
-			if (tail && timespec_before(&target, &tail->expires))
-				target = tail->expires;
-		}
-	}
-
-
-	frame->expires = target;
-	// queue frames into qos queue
-	list_add_tail(&frame->list, &queue->frames);
-	rearm_timer(wmediumd);
-#else
-	frame->flags |= HWSIM_TX_STAT_ACK;
-#endif
-
-}
-
 
 /*
  * Report transmit status to the kernel.
@@ -838,6 +528,7 @@ int send_cloned_frame_msg(struct station *dst,
 
 	rc = nla_put(msg, HWSIM_ATTR_ADDR_RECEIVER, ETH_ALEN, dst->hwaddr);
 	rc = nla_put(msg, HWSIM_ATTR_FRAME, data_len, data);
+	// TODO: modify?
 	rc = nla_put_u32(msg, HWSIM_ATTR_RX_RATE, 1);
 	rc = nla_put_u32(msg, HWSIM_ATTR_SIGNAL, -50);
 
@@ -889,25 +580,9 @@ void deliver_frame(struct frame *frame)
 				 * reverse link from sender -- check for
 				 * each receiver.
 				 */
-#ifdef PERFECT_CHANNEL
 				signal = SNR_DEFAULT;
-#else
-				signal = get_link_snr(station, sender);
-#endif
-				// TODO:
-#ifndef PERFECT_CHANNEL
-				rate_idx = index_to_rate[index_to_rate_size];
-				error_prob = get_error_prob((double)signal,
-							    rate_idx, frame->data_len);
+				frame->signal = signal;
 
-
-				if (drand48() <= error_prob) {
-					MY_PRINTF("Dropped mcast from "
-					       MAC_FMT " to " MAC_FMT " at receiver\n",
-					       MAC_ARGS(src), MAC_ARGS(station->addr));
-					continue;
-				}
-#endif
 				send_cloned_frame_msg(station,
 						      frame->data,
 						      frame->data_len,
@@ -927,64 +602,14 @@ void deliver_frame(struct frame *frame)
 	}
 
 	// necessary to prevent netlink errors (code 3)
+	// NOTE: the method is used by process_incoming_frames too!
 	if(is_local_mac(src)) {
 
 		send_tx_info_frame_nl(sender, frame->flags,
 							  frame->signal, frame->tx_rates, frame->cookie);
 	}
 
-	//free(frame);
 }
-
-#ifndef PERFECT_CHANNEL
-void deliver_expired_frames_queue(struct list_head *queue,
-				  struct timespec *now)
-{
-	struct frame *frame, *tmp;
-
-	list_for_each_entry_safe(frame, tmp, queue, list) {
-		if (timespec_before(&frame->expires, now)) {
-			// deliver frame and remove it from the queue
-			list_del(&frame->list);
-			deliver_frame(frame);
-		} else {
-			break;
-		}
-	}
-}
-
-void deliver_expired_frames(struct wmediumd *ctx)
-{
-	struct timespec now;
-	struct station *station;
-	struct list_head *l;
-	int i;
-
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	// TODO: we have only one station
-	list_for_each_entry(station, &ctx->stations, list) {
-
-		// TODO: needs to be copied to each station!
-#ifndef PERFECT_CHANNEL
-		int q_ct[IEEE80211_NUM_ACS] = {};
-		// iterate over wlan queues
-		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
-			list_for_each(l, &station->queues[i].frames) {
-				q_ct[i]++;
-			}
-		}
-		MY_PRINTF("[" TIME_FMT "] Station " MAC_FMT
-					   " BK %d BE %d VI %d VO %d\n",
-			   TIME_ARGS(&now), MAC_ARGS(station->addr),
-			   q_ct[IEEE80211_AC_BK], q_ct[IEEE80211_AC_BE],
-			   q_ct[IEEE80211_AC_VI], q_ct[IEEE80211_AC_VO]);
-#endif
-		for (i = 0; i < IEEE80211_NUM_ACS; i++)
-			deliver_expired_frames_queue(&station->queues[i].frames, &now);
-
-	}
-}
-#endif
 
 static
 int nl_err_cb(struct sockaddr_nl *nla, struct nlmsgerr *nlerr, void *arg)
@@ -1011,54 +636,25 @@ static void process_incoming_frames() {
 
 		// receive frame
 		struct frame *frame = recv_frame(mysocket);
-
-		//struct frame *detransformed_frame;
-
-		// deserialize it
-		//detransformed_frame = frame_deserialization(frame);
-
-#ifdef PERFECT_CHANNEL_NO_QUEUES
 		deliver_frame(frame);
-#else
-		// queue frame
-		queue_frame(frame);
-#endif
-
 		free(frame);
-//#ifdef PERFECT_CHANNEL_NO_QUEUES
-//		free(detransformed_frame);
-//#endif
 
 	}
 }
 
 void process_frame(struct frame *frame) {
-#ifdef PERFECT_CHANNEL_NO_QUEUES
+
     frame->flags |= HWSIM_TX_STAT_ACK;
     deliver_frame(frame);
-#else
-    // TODO: free frame
-                queue_frame(frame);
-#endif
 
-    //			struct frame_copy *transformed_frame;
-    //			// TODO: do not send local frames?
-    //			// send frame via network, but ignore received frames from others
-    //			transformed_frame = frame_serialize(frame);
-    //
     MY_PRINTF("sending frame ...\n");
     if (0 > send_frame(frame)) {
         // TODO: replace perror calls?
         perror("Could not send frame!\n");
         exit(1);
     }
-    //			free(transformed_frame);
 
-#ifdef PERFECT_CHANNEL_NO_QUEUES
     free(frame);
-    // TODO: free for else case!
-#endif
-    //			MY_PRINTF("sending frame [done]\n");
 }
 
 threadpool thpool;
@@ -1103,6 +699,8 @@ static int process_messages_cb(struct nl_msg *msg)
                     (struct hwsim_tx_rate *)
                             nla_data(attrs[HWSIM_ATTR_TX_INFO]);
             u64 cookie = nla_get_u64(attrs[HWSIM_ATTR_COOKIE]);
+			// TODO: get HWSIM_ATTR_SIGNAL and HWSIM_ATTR_RX_RATE?
+			// See also: http://lxr.free-electrons.com/source/drivers/net/wireless/mac80211_hwsim.h
 
             // ieee80211 frame
             hdr = (struct ieee80211_hdr *) data;
@@ -1137,11 +735,7 @@ static int process_messages_cb(struct nl_msg *msg)
                    min(tx_rates_len, sizeof(frame->tx_rates)));
 
             frame->frame_len = sizeof(struct frame) + frame->data_len;
-#ifdef USE_THREAD_POOL
-            thpool_add_work(thpool, (void *) process_frame, frame);
-#else
             process_frame(frame);
-#endif
 
         }
 	}
@@ -1229,17 +823,6 @@ void print_help(int exval)
 	exit(exval);
 }
 
-#ifndef PERFECT_CHANNEL
-static void timer_cb(int fd, short what, void *data)
-{
-	struct wmediumd *ctx = data;
-
-	deliver_expired_frames(ctx);
-	rearm_timer(ctx);
-}
-#endif
-
-
 int main(int argc, char *argv[])
 {
 	int opt;
@@ -1307,20 +890,10 @@ int main(int argc, char *argv[])
 	}
 
 	/* init netlink */
-#ifdef USE_THREAD_POOL
-    thpool = thpool_init(32);
-#endif
 	init_netlink();
 	event_set(&ev_cmd, nl_socket_get_fd(ctx.sock), EV_READ | EV_PERSIST,
 		  sock_event_cb, &ctx);
 	event_add(&ev_cmd, NULL);
-
-#ifndef PERFECT_CHANNEL
-	/* setup timers */
-	ctx.timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
-	event_set(&ev_timer, ctx.timerfd, EV_READ | EV_PERSIST, timer_cb, &ctx);
-	event_add(&ev_timer, NULL);
-#endif
 
 	// process incoming frames
 	// TODO: libevent
