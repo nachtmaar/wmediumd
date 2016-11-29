@@ -5,7 +5,11 @@ from fabric.api import *
 from fabric.contrib.project import rsync_project
 import os
 
-def deploy_code(start_cmd=None, deploy_cmd=None, start_debug=False, quiet=False, callgrind=False):
+env.disable_known_hosts = True
+
+def deploy_code(start_cmd=None, deploy_cmd=None, start_debug=False, quiet=False, callgrind=False,bg=False):
+    bg = (bg=='True')
+
     PATH_WMEDIUMD="/root/wmediumd/"
     PATH_WMEDIUMD_SOURCE=os.path.join(PATH_WMEDIUMD, "wmediumd/")
 
@@ -16,11 +20,11 @@ def deploy_code(start_cmd=None, deploy_cmd=None, start_debug=False, quiet=False,
             run(deploy_cmd)
     else:
         rsync_project(
-            # local_dir="/Users/nils/Dropbox/uni/masterarbeit/wmediumd",
             local_dir=os.path.join(os.getcwd()),
             remote_dir="/root/",
             exclude=["*.pyc", "*.o"],
-            delete=True
+            delete=True,
+            ssh_opts="-o StrictHostKeyChecking=no"
         )
     with cd(PATH_WMEDIUMD_SOURCE):
         run("./compile.sh")
@@ -42,5 +46,8 @@ def deploy_code(start_cmd=None, deploy_cmd=None, start_debug=False, quiet=False,
 
         if start_debug:
             start_cmd = "{} {}".format("gdb --args", start_cmd)
+
+        if bg:
+            start_cmd = "nohup {} &".format(start_cmd)
 
         run(start_cmd)

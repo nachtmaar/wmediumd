@@ -35,6 +35,7 @@
 #include "ieee80211.h"
 #include "config.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,8 @@
 #include <assert.h>
 #include <pthread.h>
 #include <netdb.h>
+#include "../thpool/thpool.h"
+#include <sys/sysinfo.h>
 
 #include "message.h"
 
@@ -56,8 +59,10 @@
 // otherwise use TCP!
 #define SOCK_OPT_MCAST
 #define MCAST_GROUP "239.0.0.1"
+#define PERFECT_CHANNEL
 
-#define MODE_DISTRIBUTED
+//#define TCP_SMALL_WRITE
+//#define USE_THREAD_POOL
 
 /* valgrind performance study PERFECT_CHANNEL_NO_QUEUES:
     424,411,339  /build/glibc-GKVZIf/glibc-2.23/stdio-common/vfscanf.c:_IO_vfscanf [/lib/x86_64-linux-gnu/libc-2.23.so]
@@ -172,8 +177,8 @@ static inline bool is_local_mac(uint8_t *mac) {
 #ifdef SOCK_OPT_MCAST
 static inline struct frame** recv_frame(int socket) {
 	ssize_t len;
-
 	char buffer[BUF_SIZE];
+
 	len = recv(socket, buffer, BUF_SIZE, 0);
 	if(0 >= len) {
 		perror("socket recv error: \n");
@@ -193,12 +198,16 @@ struct frame** recv_frame(int socket) {
 	ssize_t len = 0;
 	ssize_t ret_code;
 
-//	// TODO: add check for every recv call
-//	unsigned char node_id;
-//	ret_code = recv(socket, &node_id, sizeof(char), 0);
-//	check_recv_call(ret_code == sizeof(char));
-//	len += ret_code;
-
+//	fd_set rfds;
+//
+//	MY_PRINTF("waiting for select ...\n");
+//	FD_ZERO(&rfds);
+//	FD_SET(socket, &rfds);
+//
+//	if (0 >= select(FD_SETSIZE, &rfds, NULL, NULL, NULL)) {
+//		perror("select()");
+//		return EXIT_FAILURE;
+//	}
 	uint16_t frame_size;
 	ret_code = recv(socket, &frame_size, sizeof(frame_size), MSG_WAITALL);
    	check_recv_call(ret_code == sizeof(frame_size) && ret_code > 0);
@@ -247,7 +256,17 @@ int connect_frame_distribution_socket() {
 
 #else
 	mysocket = socket(AF_INET, SOCK_STREAM, 0);
+	#ifdef TCP_SMALL_WRITE
+	int one = 1;
+
+	setsockopt(mysocket, SOL_TCP, TCP_NODELAY, &one, sizeof(one));
+	#endif
 #endif
+
+    int reuse = 1;
+    if (setsockopt(mysocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)) < 0) {
+        perror("setsockopt(SO_REUSEADDR) failed");
+    }
 	if(0 > mysocket) {
 		fprintf(stderr, "Error: Could not create socket!\n");
 		return EXIT_FAILURE;
@@ -263,11 +282,13 @@ int connect_frame_distribution_socket() {
 #ifdef SOCK_OPT_MCAST
 	if(0 > bind(mysocket, (struct sockaddr*) &addr, sizeof(addr))) {
 #else
-	inet_aton("172.21.0.3", &addr.sin_addr);
+# TODO: remove hardcoded IP addresses and use CLI instead
+	unsigned long ip_addr = inet_addr("172.21.0.254");
+	memcpy( (char *)&addr.sin_addr, &ip_addr, sizeof(ip_addr));
 
 	if(0 > connect(mysocket, (struct sockaddr *)&addr, sizeof(addr))) {
 #endif
-		fprintf(stderr, "Error : Connect Failed \n");
+		perror("Connect Failed\n");
 		return EXIT_FAILURE;
 	}
 #ifdef SOCK_OPT_MCAST
@@ -282,6 +303,7 @@ int connect_frame_distribution_socket() {
 	}
 #endif
 
+	//fcntl(mysocket, F_SETFL, O_NONBLOCK);
 	return EXIT_SUCCESS;
 }
 
@@ -402,9 +424,8 @@ static inline int send_frame(struct frame *frame)
 	addr.sin_addr.s_addr = inet_addr(MCAST_GROUP);
 	addr.sin_port = htons(PORTNUM);
 
-
 	// send actual payload
-	if(0 >= sendto(mysocket, frame, frame_len, 0, (struct sockaddr*) &addr, sizeof(addr)))  {
+	if(0 >= sendto(mysocket, frame, frame_len, MSG_DONTWAIT, (struct sockaddr*) &addr, sizeof(addr)))  {
 		fprintf(stderr, "Error : Send Failed \n");
 		return EXIT_FAILURE;
 	}
@@ -415,7 +436,7 @@ static inline int send_frame(struct frame *frame)
 #else
 
 	// send actual payload
-	if(0 >= send(mysocket, frame, frame_len, 0)) {
+	if(0 >= send(mysocket, frame, frame_len, MSG_DONTWAIT)) {
 		MY_PRINTF("Error : Send Failed \n");
 		return EXIT_FAILURE;
 	}
@@ -1011,12 +1032,44 @@ static void process_incoming_frames() {
 	}
 }
 
+void process_frame(struct frame *frame) {
+#ifdef PERFECT_CHANNEL_NO_QUEUES
+    frame->flags |= HWSIM_TX_STAT_ACK;
+    deliver_frame(frame);
+#else
+    // TODO: free frame
+                queue_frame(frame);
+#endif
+
+    //			struct frame_copy *transformed_frame;
+    //			// TODO: do not send local frames?
+    //			// send frame via network, but ignore received frames from others
+    //			transformed_frame = frame_serialize(frame);
+    //
+    MY_PRINTF("sending frame ...\n");
+    if (0 > send_frame(frame)) {
+        // TODO: replace perror calls?
+        perror("Could not send frame!\n");
+        exit(1);
+    }
+    //			free(transformed_frame);
+
+#ifdef PERFECT_CHANNEL_NO_QUEUES
+    free(frame);
+    // TODO: free for else case!
+#endif
+    //			MY_PRINTF("sending frame [done]\n");
+}
+
+threadpool thpool;
+
 /*
  * Handle events from the kernel.  Process CMD_FRAME events and queue them
  * for later delivery with the scheduler.
  */
-static int process_messages_cb(struct nl_msg *msg, void *arg)
+static int process_messages_cb(struct nl_msg *msg)
 {
+
 	struct nlattr *attrs[HWSIM_ATTR_MAX+1];
 
 	// split kernel `msg` into header and body
@@ -1037,81 +1090,60 @@ static int process_messages_cb(struct nl_msg *msg, void *arg)
 		genlmsg_parse(nlh, 0, attrs, HWSIM_ATTR_MAX, NULL);
 		if (attrs[HWSIM_ATTR_ADDR_TRANSMITTER]) {
 
-			// put items from `attrs` into local vars
-			u8 *hwaddr = (u8 *)nla_data(attrs[HWSIM_ATTR_ADDR_TRANSMITTER]);
-			unsigned int data_len =
-				nla_len(attrs[HWSIM_ATTR_FRAME]);
-			char *data = (char *)nla_data(attrs[HWSIM_ATTR_FRAME]);
-			uint32_t flags =
-				nla_get_u32(attrs[HWSIM_ATTR_FLAGS]);
-			unsigned int tx_rates_len =
-				nla_len(attrs[HWSIM_ATTR_TX_INFO]);
-			struct hwsim_tx_rate *tx_rates =
-				(struct hwsim_tx_rate *)
-				nla_data(attrs[HWSIM_ATTR_TX_INFO]);
-			u64 cookie = nla_get_u64(attrs[HWSIM_ATTR_COOKIE]);
+            // put items from `attrs` into local vars
+            u8 *hwaddr = (u8 *) nla_data(attrs[HWSIM_ATTR_ADDR_TRANSMITTER]);
+            unsigned int data_len =
+                    nla_len(attrs[HWSIM_ATTR_FRAME]);
+            char *data = (char *) nla_data(attrs[HWSIM_ATTR_FRAME]);
+            uint32_t flags =
+                    nla_get_u32(attrs[HWSIM_ATTR_FLAGS]);
+            unsigned int tx_rates_len =
+                    nla_len(attrs[HWSIM_ATTR_TX_INFO]);
+            struct hwsim_tx_rate *tx_rates =
+                    (struct hwsim_tx_rate *)
+                            nla_data(attrs[HWSIM_ATTR_TX_INFO]);
+            u64 cookie = nla_get_u64(attrs[HWSIM_ATTR_COOKIE]);
 
-			// ieee80211 frame
-			hdr = (struct ieee80211_hdr *)data;
-			src = hdr->addr2;
+            // ieee80211 frame
+            hdr = (struct ieee80211_hdr *) data;
+            src = hdr->addr2;
 
-			if (data_len < 6 + 6 + 4)
-				goto out;
+            if (data_len < 6 + 6 + 4)
+                goto out;
 
-			// create sender struct
-			// TODO:
-			sender = get_station_by_addr(src);
-			if (!sender) {
-				fprintf(stderr, "Unable to find sender station " MAC_FMT "\n", MAC_ARGS(src));
-				goto out;
-			}
-			memcpy(sender->hwaddr, hwaddr, ETH_ALEN);
+            // create sender struct
+            // TODO:
+            sender = get_station_by_addr(src);
+            if (!sender) {
+                fprintf(stderr, "Unable to find sender station " MAC_FMT "\n", MAC_ARGS(src));
+                goto out;
+            }
+            memcpy(sender->hwaddr, hwaddr, ETH_ALEN);
 
-			frame = mymalloc_zero(sizeof(*frame) + data_len);
+            frame = mymalloc_zero(sizeof(*frame) + data_len);
 
-			if (!frame)
-				goto out;
+            if (!frame)
+                goto out;
 
-			// envelope IEEE 802.11 frame
-			memcpy(frame->data, data, data_len);
-			frame->data_len = data_len;
-			frame->flags = flags;
-			frame->cookie = cookie;
-			frame->sender = sender->index;
-			frame->tx_rates_count =
-				tx_rates_len / sizeof(struct hwsim_tx_rate);
-			memcpy(frame->tx_rates, tx_rates,
-			       min(tx_rates_len, sizeof(frame->tx_rates)));
+            // envelope IEEE 802.11 frame
+            memcpy(frame->data, data, data_len);
+            frame->data_len = data_len;
+            frame->flags = flags;
+            frame->cookie = cookie;
+            frame->sender = sender->index;
+            frame->tx_rates_count =
+                    tx_rates_len / sizeof(struct hwsim_tx_rate);
+            memcpy(frame->tx_rates, tx_rates,
+                   min(tx_rates_len, sizeof(frame->tx_rates)));
 
-			frame->frame_len = sizeof(struct frame) + frame->data_len;
-#ifdef PERFECT_CHANNEL_NO_QUEUES
-			frame->flags |= HWSIM_TX_STAT_ACK;
-			deliver_frame(frame);
+            frame->frame_len = sizeof(struct frame) + frame->data_len;
+#ifdef USE_THREAD_POOL
+            thpool_add_work(thpool, (void *) process_frame, frame);
 #else
-            // TODO: free frame
-			queue_frame(frame);
+            process_frame(frame);
 #endif
 
-//			struct frame_copy *transformed_frame;
-//			// TODO: do not send local frames?
-//			// send frame via network, but ignore received frames from others
-//			transformed_frame = frame_serialize(frame);
-//
-			MY_PRINTF("sending frame ...\n");
-			if (0 > send_frame(frame)) {
-				// TODO: replace perror calls?
-				perror("Could not send frame!\n");
-				exit(1);
-			}
-//			free(transformed_frame);
-
-#ifdef PERFECT_CHANNEL_NO_QUEUES
-			free(frame);
-			// TODO: free for else case!
-#endif
-//			MY_PRINTF("sending frame [done]\n");
-		}
-
+        }
 	}
 	out:
 	return 0;
@@ -1275,6 +1307,9 @@ int main(int argc, char *argv[])
 	}
 
 	/* init netlink */
+#ifdef USE_THREAD_POOL
+    thpool = thpool_init(32);
+#endif
 	init_netlink();
 	event_set(&ev_cmd, nl_socket_get_fd(ctx.sock), EV_READ | EV_PERSIST,
 		  sock_event_cb, &ctx);
