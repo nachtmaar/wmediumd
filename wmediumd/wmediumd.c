@@ -50,9 +50,8 @@
 #include "../thpool/thpool.h"
 #include <sys/sysinfo.h>
 
-#include "message.h"
-
 #define BUF_SIZE 65536
+#define PORTNUM 1234
 
 // otherwise use TCP!
 #define SOCK_OPT_MCAST
@@ -443,11 +442,6 @@ static inline int send_frame(struct frame *frame)
 	return EXIT_SUCCESS;
 }
 
-#define index_to_rate_size 8
-static int index_to_rate[] = {
-	60, 90, 120, 180, 240, 360, 480, 540
-};
-
 static struct station *get_station_by_addr(u8 *addr)
 {
 	struct station *station;
@@ -484,6 +478,7 @@ int send_tx_info_frame_nl(struct station *src,
 
 	rc = nla_put(msg, HWSIM_ATTR_ADDR_TRANSMITTER, ETH_ALEN, src->hwaddr);
 	rc = nla_put_u32(msg, HWSIM_ATTR_FLAGS, flags);
+
 	rc = nla_put_u32(msg, HWSIM_ATTR_SIGNAL, signal);
 	rc = nla_put(msg, HWSIM_ATTR_TX_INFO,
 				 IEEE80211_TX_MAX_RATES * sizeof(struct hwsim_tx_rate),
@@ -571,16 +566,7 @@ void deliver_frame(struct frame *frame)
 
 			// beacon frames
 			if (is_multicast_ether_addr(dest)) {
-				uint32_t signal;
-				int rate_idx;
-
-				double error_prob;
-				/*
-				 * we may or may not receive this based on
-				 * reverse link from sender -- check for
-				 * each receiver.
-				 */
-				signal = SNR_DEFAULT;
+				uint32_t signal = SNR_DEFAULT;
 				frame->signal = signal;
 
 				send_cloned_frame_msg(station,
@@ -668,8 +654,6 @@ static int process_messages_cb(struct nl_msg *msg)
 
 	struct nlattr *attrs[HWSIM_ATTR_MAX+1];
 
-	// split kernel `msg` into header and body
-
 	/* netlink header */
 	struct nlmsghdr *nlh = nlmsg_hdr(msg);
 	/* generic netlink header*/
@@ -682,23 +666,36 @@ static int process_messages_cb(struct nl_msg *msg)
 
 	// handle only command frames
 	if (gnlh->cmd == HWSIM_CMD_FRAME) {
-		/* we get the attributes from `nlh` */
+		// parse into attrs
 		genlmsg_parse(nlh, 0, attrs, HWSIM_ATTR_MAX, NULL);
+
 		if (attrs[HWSIM_ATTR_ADDR_TRANSMITTER]) {
 
-            // put items from `attrs` into local vars
             u8 *hwaddr = (u8 *) nla_data(attrs[HWSIM_ATTR_ADDR_TRANSMITTER]);
+            // get length
             unsigned int data_len =
                     nla_len(attrs[HWSIM_ATTR_FRAME]);
+
+            // allocate frame
+            frame = mymalloc_zero(sizeof(*frame) + data_len);
+
             char *data = (char *) nla_data(attrs[HWSIM_ATTR_FRAME]);
-            uint32_t flags =
-                    nla_get_u32(attrs[HWSIM_ATTR_FLAGS]);
+            memcpy(frame->data, data, data_len);
+            frame->data_len = data_len;
+
+            frame->flags = nla_get_u32(attrs[HWSIM_ATTR_FLAGS]);
             unsigned int tx_rates_len =
                     nla_len(attrs[HWSIM_ATTR_TX_INFO]);
             struct hwsim_tx_rate *tx_rates =
                     (struct hwsim_tx_rate *)
                             nla_data(attrs[HWSIM_ATTR_TX_INFO]);
-            u64 cookie = nla_get_u64(attrs[HWSIM_ATTR_COOKIE]);
+            frame->tx_rates_count = (uint32_t)
+                    tx_rates_len / sizeof(struct hwsim_tx_rate);
+            memcpy(frame->tx_rates, tx_rates,
+                   min(tx_rates_len, sizeof(frame->tx_rates)));
+
+            frame->cookie = nla_get_u64(attrs[HWSIM_ATTR_COOKIE]);
+
 			// TODO: get HWSIM_ATTR_SIGNAL and HWSIM_ATTR_RX_RATE?
 			// See also: http://lxr.free-electrons.com/source/drivers/net/wireless/mac80211_hwsim.h
 
@@ -718,23 +715,9 @@ static int process_messages_cb(struct nl_msg *msg)
             }
             memcpy(sender->hwaddr, hwaddr, ETH_ALEN);
 
-            frame = mymalloc_zero(sizeof(*frame) + data_len);
-
-            if (!frame)
-                goto out;
-
-            // envelope IEEE 802.11 frame
-            memcpy(frame->data, data, data_len);
-            frame->data_len = data_len;
-            frame->flags = flags;
-            frame->cookie = cookie;
             frame->sender = sender->index;
-            frame->tx_rates_count =
-                    tx_rates_len / sizeof(struct hwsim_tx_rate);
-            memcpy(frame->tx_rates, tx_rates,
-                   min(tx_rates_len, sizeof(frame->tx_rates)));
+            frame->frame_len = (uint32_t) sizeof(struct frame) + frame->data_len;
 
-            frame->frame_len = sizeof(struct frame) + frame->data_len;
             process_frame(frame);
 
         }
@@ -827,7 +810,6 @@ int main(int argc, char *argv[])
 {
 	int opt;
 	struct event ev_cmd;
-	struct event ev_timer;
 	struct wmediumd ctx;
 	wmediumd = &ctx;
 

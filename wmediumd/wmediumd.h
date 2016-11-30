@@ -94,40 +94,25 @@ struct station {
 	unsigned int index;
 	u8 addr[ETH_ALEN];		/* virtual interface mac address */
 	u8 hwaddr[ETH_ALEN];		/* hardware address of hwsim radio */
-	struct wqueue queues[IEEE80211_NUM_ACS];
 	struct list_head list;
 };
 
 struct frame {
-    // TODO: not needed for UDP version!
-	// 2312 MTU 802.11 + sizeof(struct frame) = 2 bytes = max value: 65536
     uint16_t frame_len;
+
+    // hwsim related
     u64 cookie;
     uint32_t flags;
 	uint32_t signal;
-    int tx_rates_count;
+    uint32_t tx_rates_count;
 	// assume there are at most 256 senders!
 	uint8_t sender;
     struct hwsim_tx_rate tx_rates[IEEE80211_TX_MAX_RATES];
-    size_t data_len;
-    u8 data[0];			/* frame contents */
+    uint32_t data_len;
+    // actual frame
+    u8 data[0];
 };
 
-struct frame_copy {
-	// TODO: make ssize_t
-	int total_struct_length;
-	struct timespec expires;	/* frame delivery (absolute) */
-	bool acked;
-	u64 cookie;
-	int flags;
-	int signal;
-	int tx_rates_count;
-	// u8, list_head
-	int sender;
-	struct hwsim_tx_rate tx_rates[IEEE80211_TX_MAX_RATES];
-	size_t data_len;
-	u8 data[0];			/* frame contents */
-};
 
 int mysocket;
 
